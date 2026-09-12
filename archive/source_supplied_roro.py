@@ -8863,6 +8863,35 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
     if STATE.get("open") or TRADE_STATE.get("in_position"):
         log_execution(f"[ENTRY] Already in position, skipping {symbol}", "WARN")
         return False
+
+    # ===== BARON ZONE/OB QUALITY JUDGE (additive gate; RORO entry logic untouched) =====
+    if os.environ.get("BARON_ZONE_JUDGE", "1") != "0":
+        try:
+            import sys as _bj_sys
+            try:
+                import baron_zone_judge as _baron_judge
+            except Exception:
+                _bj_path = os.environ.get("BARON_ZONE_JUDGE_PATH", "")
+                if _bj_path and _bj_path not in _bj_sys.path:
+                    _bj_sys.path.insert(0, _bj_path)
+                import baron_zone_judge as _baron_judge
+            _bj_df = get_ohlcv_safe(symbol, 100)
+            _bj_verdict = _baron_judge.assess(
+                symbol=symbol, side=side, df=_bj_df, atr=atr_val, price=price,
+                ctx={"entry_type": entry_type or ""})
+            log_execution(
+                f"[BARON_JUDGE] {symbol} {side} -> {_bj_verdict.decision} "
+                f"| score={_bj_verdict.final_zone_score} | "
+                f"{_bj_verdict.main_blocker or _bj_verdict.pending_reason}",
+                "WARN" if _bj_verdict.decision != "ENTER_NOW" else "INFO",
+                debounce_key=f"baron_judge_{symbol}", debounce_sec=30)
+            if _bj_verdict.decision != "ENTER_NOW":
+                return False
+        except Exception as _bj_err:
+            log_execution(f"[BARON_JUDGE] FAIL-CLOSED, entry blocked: {_bj_err}", "WARN",
+                          debounce_key="baron_judge_error", debounce_sec=300)
+            return False
+
     free_bal = get_free_balance_safe() if not PAPER_MODE else paper["balance"]
     usable_balance = free_bal * BALANCE_SAFETY_FACTOR
     if PAPER_MODE:
