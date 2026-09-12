@@ -21,6 +21,7 @@ import os
 import unittest
 from unittest.mock import patch
 
+import pytest
 import numpy as np
 import pandas as pd
 
@@ -28,6 +29,25 @@ os.environ.setdefault("PAPER_MODE", "True")
 os.environ.setdefault("BINGX_KEY", "")
 os.environ.setdefault("BINGX_SECRET", "")
 os.environ.setdefault("NEWS_ENABLED", "True")
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _restore_environ_after_module():
+    """Snapshot os.environ before this module's tests run and restore it once
+    the module finishes.
+
+    ``IfvgSixPositionLifecycleStressTest.setUp`` writes paper / news env
+    overrides for its own scenario (e.g. NEWS_ENABLED=False) but never
+    restores the original values afterward, which leaked into later
+    modules during aggregate ``pytest`` runs and broke
+    ``NewsEntityMatchingTest``.  Restoring the exact pre-module baseline
+    isolates this module without touching any production source file.
+    """
+    baseline = dict(os.environ)
+    yield
+    os.environ.clear()
+    os.environ.update(baseline)
+
 
 import core.engine as E  # noqa: E402
 import scanner.deep_scanner as DS  # noqa: E402
