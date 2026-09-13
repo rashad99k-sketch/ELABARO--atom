@@ -1891,6 +1891,7 @@ class ExchangeSyncService:
         self._last_snapshot = PositionSnapshot()
         self._reconcile_count = 0
         self._last_reconcile = 0
+        self._last_reconcile_by_symbol = {}
 
     def fetch_all_open_positions(self):
         """All open positions across symbols (recovery source for PortfolioManager)."""
@@ -2002,8 +2003,10 @@ class ExchangeSyncService:
 
     def reconcile(self, symbol, local_state):
         now = time.time()
-        if now - self._last_reconcile < 10:
+        key = symbol or "GLOBAL"
+        if now - self._last_reconcile_by_symbol.get(key, 0.0) < 10:
             return
+        self._last_reconcile_by_symbol[key] = now
         self._last_reconcile = now
         log_execution(f"[RECONCILIATION] Starting for {symbol}", "INFO")
         self._reconcile_count += 1
