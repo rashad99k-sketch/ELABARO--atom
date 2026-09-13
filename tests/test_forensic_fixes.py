@@ -382,9 +382,8 @@ class ForensicFixesTest(unittest.TestCase):
         self.assertEqual(pm.max_positions, 6)
         self.assertLessEqual(pm.count(), 6)
         from portfolio.allocator import DEFAULT_CLASS_CAPS
-        self.assertEqual(pm.max_technical_positions, 5)
-        self.assertEqual(DEFAULT_CLASS_CAPS.get("NEWS"), 1)
-        self.assertEqual(sum(1 for k in DEFAULT_CLASS_CAPS if k != "NEWS"), 8)
+        self.assertEqual(sum(v for k, v in DEFAULT_CLASS_CAPS.items()
+                             if k != "NEWS"), 6)
 
     # ---- 16. NEWS slot admits at most one ----
     def test_news_slot_at_most_one(self):

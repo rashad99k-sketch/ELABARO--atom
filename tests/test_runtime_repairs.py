@@ -1162,10 +1162,8 @@ class CrossAssetDiscoveryTest(unittest.TestCase):
         r = a.allocate(cands, limit=6)
         allowed = {d.asset_class for d in r.decisions if d.allowed}
         self.assertEqual({"CRYPTO", "INDEX", "GOLD", "OIL"}, {"CRYPTO", "INDEX", "GOLD", "OIL"} & allowed)
-        # STOCK is now executable when a technical slot is available; the global
-        # technical ceiling still prevents it from opening once five technical
-        # positions are already occupied.
-        self.assertIn("STOCK", allowed)
+        # STOCK has no slot in the 6-market model (CRYPTO x2 / INDEX x2 / GOLD x1 / OIL x1 + NEWS).
+        self.assertNotIn("STOCK", allowed)
 
 
 class TradFiStockDiscoveryTest(unittest.TestCase):
@@ -1244,16 +1242,16 @@ class TradFiStockDiscoveryTest(unittest.TestCase):
         self.assertEqual(market_status({"info": {}})["market_status"], "UNKNOWN")
         self.assertEqual(market_status({"info": {}})["source"], "FALLBACK")
 
-    # H. Expanded-market allocator: STOCK receives one executable slot when capacity is available
-    def test_allocator_accepts_stock_when_capacity_is_available(self):
+    # H. Allocator compatibility: STOCK candidate has NO slot in the 6-market model
+    def test_allocator_rejects_stock_outside_six_market_model(self):
         from portfolio.manager import PortfolioManager
         from portfolio.allocator import GlobalAssetAllocator
         m = PortfolioManager(6, None)
         a = GlobalAssetAllocator(m, E)
         r = a.allocate([{"symbol": "NCSKAAPL2USD/USDT:USDT", "asset_class": "STOCK",
                          "side": "BUY", "priority_score": 70.0}], limit=6)
-        self.assertTrue(r.decisions[0].allowed)
-        self.assertEqual(r.decisions[0].reason, "OK")
+        self.assertFalse(r.decisions[0].allowed)
+        self.assertEqual(r.decisions[0].reason, "STOCK_CAP")
 
 
 class QueuePromotionsPayloadTest(unittest.TestCase):

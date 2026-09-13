@@ -33,18 +33,18 @@ if errorlevel 1 (
   echo [SETUP] Dependencies already installed.
 )
 
-echo [CHECK] Verifying Python source tree...
-python tools\verify_project.py
-if errorlevel 1 (
-  echo [ERROR] Source verification failed. Bot was NOT started.
-  pause
-  exit /b 1
-)
-
 if not exist ".env" (
   copy /Y ".env.example" ".env" >nul
   echo [SETUP] Created .env from .env.example.
   echo Add your API credentials before enabling LIVE mode.
+)
+
+echo [CHECK] Verifying Python source tree...
+python verify_project.py
+if errorlevel 1 (
+  echo [ERROR] Source verification failed. Bot was NOT started.
+  pause
+  exit /b 1
 )
 
 echo [CHECK] Running isolated regression tests...

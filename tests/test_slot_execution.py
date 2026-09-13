@@ -265,8 +265,8 @@ class SixMarketSlotExecutionTest(unittest.TestCase):
             self.assertEqual(PortfolioManager._class_cap("GOLD"), 1)
             self.assertEqual(PortfolioManager._class_cap("OIL"), 1)
             self.assertEqual(PortfolioManager._class_cap("NEWS"), 1)
-            self.assertEqual(PortfolioManager._class_cap("STOCK"), 1)
-            self.assertTrue(self.pm.can_open("NCSKNVDA2USD/USDT:USDT", "STOCK"))
+            self.assertEqual(PortfolioManager._class_cap("STOCK"), 0)
+            self.assertFalse(self.pm.can_open("NCSKNVDA2USD/USDT:USDT", "STOCK"))
         finally:
             if saved_env is not None:
                 os.environ["MAX_POSITIONS_PER_ASSET_CLASS"] = saved_env

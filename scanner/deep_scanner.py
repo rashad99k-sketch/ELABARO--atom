@@ -63,7 +63,7 @@ class DeepScanner:
         exchange=None,
         market_loader: Optional[Callable[[], dict]] = None,
     ):
-        self.watchlist_limit = int(os.getenv("DEEP_WATCHLIST_SIZE", str(min(max_symbols, 40))))
+        self.watchlist_limit = int(os.getenv("DEEP_WATCHLIST_SIZE", str(max_symbols)))
         # Optional dependency injection keeps tests deterministic without changing
         # the production default, which continues to use the canonical exchange.
         self.exchange = exchange
@@ -74,7 +74,7 @@ class DeepScanner:
         self.watch_interval = float(os.getenv("WATCHLIST_DEEP_INTERVAL_SEC", "10"))
         self.watch_workers = max(1, int(os.getenv("WATCHLIST_DEEP_WORKERS", "8")))
         self.watch_max_age = float(os.getenv("WATCHLIST_DEEP_MAX_AGE_SEC", "30"))
-        self.discovery_interval = float(os.getenv("GLOBAL_SCAN_INTERVAL_SEC", "1200"))
+        self.discovery_interval = float(os.getenv("GLOBAL_SCAN_INTERVAL_SEC", "900"))
         self.strategy = StrategyEngine()
         self.news = NewsService()
         self.last_scan = 0.0
@@ -91,11 +91,11 @@ class DeepScanner:
         self.radar_batch_interval = float(os.getenv("RADAR_BATCH_INTERVAL_SEC", "20"))
         self.radar_time_budget_sec = float(os.getenv("RADAR_TIME_BUDGET_SEC", "15"))
         self.radar_cycle_seconds = float(
-            os.getenv("RADAR_CYCLE_SECONDS", os.getenv("GLOBAL_SCAN_INTERVAL_SEC", "1200"))
+            os.getenv("RADAR_CYCLE_SECONDS", os.getenv("GLOBAL_SCAN_INTERVAL_SEC", "900"))
         )
         self.radar_max_calls_per_min = int(os.getenv("RADAR_MAX_CALLS_PER_MIN", "60"))
         self.radar_proximity_pct = float(os.getenv("RADAR_PROXIMITY_PCT", "0.0075"))
-        self.radar_target = int(os.getenv("RADAR_TARGET_SYMBOLS", "40"))
+        self.radar_target = int(os.getenv("RADAR_TARGET_SYMBOLS", "60"))
         self.radar_cycle: Optional[dict] = None
         self._radar_api_call_times: List[float] = []
         self.status = {
@@ -156,18 +156,12 @@ class DeepScanner:
         instruments that are actually moving cannot be cut by the radar limit.
         A provider failure degrades gracefully to venue-metadata ordering.
         """
-        exchange = self.exchange or E.ex
-        fetch_tickers = getattr(exchange, "fetch_tickers", None)
-        if not callable(fetch_tickers):
-            self.status["ticker_activity"] = "UNSUPPORTED"
-            return {}
         try:
-            tickers = fetch_tickers()
-            self.status["ticker_activity"] = "HEALTHY"
+            exchange = self.exchange or E.ex
+            tickers = exchange.fetch_tickers()
         except Exception as exc:
-            self.status["ticker_activity"] = "DEGRADED"
-            E.log_execution(f"[DEEP] ticker activity degraded: {exc}", "INFO",
-                            debounce_key="ticker_activity_degraded", debounce_sec=300)
+            E.log_execution(f"[DEEP] ticker activity unavailable: {exc}", "WARN",
+                            debounce_key="ticker_activity_fail", debounce_sec=300)
             return {}
         activity: Dict[str, float] = {}
         for sym, tk in (tickers or {}).items():
@@ -589,10 +583,6 @@ class DeepScanner:
                 "deep_analyzed": False,
                 "news": {"available": False, "risk": 0, "bias": "NEUTRAL", "headlines": []},
                 "cycle_id": self.cycle_id,
-                # Causal timestamps are initialized at watchlist admission so
-                # latency metrics measure the real watchlist->analysis window.
-                "watchlist_entry_time": now,
-                "institutional_analysis_time": 0.0,
                 "last_update": now,
             }
 
@@ -892,10 +882,6 @@ class DeepScanner:
     def _analyze_symbol(self, entry: dict) -> dict | None:
         sym = entry["symbol"]
         asset = entry.get("asset_class", "CRYPTO")
-        analysis_started_at = float(entry.get("institutional_analysis_time", 0) or 0)
-        if analysis_started_at <= 0:
-            analysis_started_at = time.time()
-            entry["institutional_analysis_time"] = analysis_started_at
         try:
             if getattr(E, "SYMBOL_GUARD", None) is not None and E.SYMBOL_GUARD.is_paused(sym):
                 return None
@@ -1026,45 +1012,66 @@ class DeepScanner:
             institutional_ob = {"BUY": {}, "SELL": {}}
             institutional_analysis = {}
             try:
+                # The canonical OB/liquidity/structure pass lives on the
+                # ExecutionQueue (EngineRunner.queue), never on InstitutionalRadar
+                # (which owns update_all/_calculate_priorities only). Calling the
+                # three evaluation methods on the wrong object used to raise
+                # AttributeError and silently degrade to INSTITUTIONAL_OB_UNAVAILABLE.
+                # Prefer the live queue; fall back to an InstitutionalRadar when a
+                # stub / alternate module exposes the evaluator methods (tests).
                 radar = getattr(self, "_institutional_radar", None)
-                if radar is None and hasattr(E, "InstitutionalRadar"):
-                    radar = E.InstitutionalRadar()
-                    self._institutional_radar = radar
-                if radar is not None:
-                    atr_i = float(E.compute_atr(df).iloc[-1])
-                    for _side in ("BUY", "SELL"):
+                if radar is None:
+                    for _candidate in (getattr(E, "queue", None),
+                                       E.InstitutionalRadar() if hasattr(E, "InstitutionalRadar") else None):
+                        if _candidate is not None and all(
+                                hasattr(_candidate, _fn)
+                                for _fn in ("_select_strong_ob", "_evaluate_liquidity", "_evaluate_structure")):
+                            radar = _candidate
+                            self._institutional_radar = radar
+                            break
+                if radar is None:
+                    raise AttributeError("institutional evaluator missing: _select_strong_ob")
+                atr_i = float(E.compute_atr(df).iloc[-1])
+                try:
+                    _ob_cfg = E.AssetBehaviorProfile.ob_config(E.AssetBehaviorProfile.resolve_asset_class(sym))
+                except Exception:
+                    _ob_cfg = None
+                for _side in ("BUY", "SELL"):
+                    try:
+                        _ob = radar._select_strong_ob(df, _side, atr_i, cfg=_ob_cfg)
+                    except TypeError:
                         _ob = radar._select_strong_ob(df, _side, atr_i)
-                        _liq, _liq_ev = radar._evaluate_liquidity(df, _side, atr_i)
-                        _struct, _struct_type = radar._evaluate_structure(df, _side)
-                        _zl = float(_ob.get("zone_low", 0) or 0)
-                        _zh = float(_ob.get("zone_high", 0) or 0)
-                        _mid = ((_zl + _zh) / 2.0) if _zl and _zh else 0.0
-                        _dist_atr = abs(float(best["price"]) - _mid) / atr_i if _mid and atr_i > 0 else 999.0
-                        institutional_ob[_side] = {
-                            "direction": "BULLISH_DEMAND" if _side == "BUY" else "BEARISH_SUPPLY",
-                            "grade": str(_ob.get("grade", "INVALID")).upper(),
-                            "score": float(_ob.get("score", 0) or 0),
-                            "zone_low": _zl,
-                            "zone_high": _zh,
-                            "freshness": int(_ob.get("freshness", 999) or 999),
-                            "displacement_atr": float(_ob.get("displacement_atr", 0) or 0),
-                            "volume_ratio": float(_ob.get("volume_ratio", 0) or 0),
-                            "touches": int(_ob.get("touches", 0) or 0),
-                            "liquidity_score": float(_liq),
-                            "liquidity_state": (_liq_ev or {}).get("state", "UNKNOWN"),
-                            "structure_score": float(_struct),
-                            "structure": getattr(_struct_type, "value", str(_struct_type)),
-                            "distance_atr": round(_dist_atr, 3),
-                            "active_near_price": bool(_ob.get("grade") in ("A", "A+") and _dist_atr <= 1.5),
-                        }
-                        if analyze_vpa is not None:
-                            try:
-                                _vpa = analyze_vpa(df, _side, zone_low=_zl or None, zone_high=_zh or None, atr=atr_i)
-                                institutional_ob[_side]["vpa"] = _vpa
-                                institutional_ob[_side]["vpa_confirmed"] = bool(_vpa.get("confirmation"))
-                                institutional_ob[_side]["vpa_adverse"] = bool(_vpa.get("adverse"))
-                            except Exception:
-                                institutional_ob[_side]["vpa"] = {}
+                    _liq, _liq_ev = radar._evaluate_liquidity(df, _side, atr_i)
+                    _struct, _struct_type = radar._evaluate_structure(df, _side)
+                    _zl = float(_ob.get("zone_low", 0) or 0)
+                    _zh = float(_ob.get("zone_high", 0) or 0)
+                    _mid = ((_zl + _zh) / 2.0) if _zl and _zh else 0.0
+                    _dist_atr = abs(float(best["price"]) - _mid) / atr_i if _mid and atr_i > 0 else 999.0
+                    institutional_ob[_side] = {
+                        "direction": "BULLISH_DEMAND" if _side == "BUY" else "BEARISH_SUPPLY",
+                        "grade": str(_ob.get("grade", "INVALID")).upper(),
+                        "score": float(_ob.get("score", 0) or 0),
+                        "zone_low": _zl,
+                        "zone_high": _zh,
+                        "freshness": int(_ob.get("freshness", 999) or 999),
+                        "displacement_atr": float(_ob.get("displacement_atr", 0) or 0),
+                        "volume_ratio": float(_ob.get("volume_ratio", 0) or 0),
+                        "touches": int(_ob.get("touches", 0) or 0),
+                        "liquidity_score": float(_liq),
+                        "liquidity_state": (_liq_ev or {}).get("state", "UNKNOWN"),
+                        "structure_score": float(_struct),
+                        "structure": getattr(_struct_type, "value", str(_struct_type)),
+                        "distance_atr": round(_dist_atr, 3),
+                        "active_near_price": bool(_ob.get("grade") in ("A", "A+") and _dist_atr <= 1.5),
+                    }
+                    if analyze_vpa is not None:
+                        try:
+                            _vpa = analyze_vpa(df, _side, zone_low=_zl or None, zone_high=_zh or None, atr=atr_i)
+                            institutional_ob[_side]["vpa"] = _vpa
+                            institutional_ob[_side]["vpa_confirmed"] = bool(_vpa.get("confirmation"))
+                            institutional_ob[_side]["vpa_adverse"] = bool(_vpa.get("adverse"))
+                        except Exception:
+                            institutional_ob[_side]["vpa"] = {}
                     _buy = institutional_ob["BUY"]
                     _sell = institutional_ob["SELL"]
                     _win = institutional_ob.get(best["side"], {})
@@ -1358,7 +1365,6 @@ class DeepScanner:
                     "orderbook_imbalance": (round(ob_imbalance, 4) if ob_imbalance is not None else None),
                     "fvg": fvg,
                     "deep_analyzed": True,
-                    "institutional_analysis_time": analysis_started_at,
                     "analysis_age": round(analysis_age, 1),
                     "data_age": round(data_age, 1),
                     "data_quality": data_quality,

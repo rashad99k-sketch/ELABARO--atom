@@ -105,11 +105,13 @@ class EngineOutcomeZoneWiringTest(unittest.TestCase):
         E.tg_close("BTC/USDT:USDT", 3.25, 12.0, "BUY", pnl_usdt=32.5, reason="TP2", trade_id="TRD-42")
         self.assertEqual(len(sent), 1)
         msg = sent[0][0]
-        self.assertIn("TRADE CLOSED — WIN", msg)
-        self.assertIn("BTC/USDT:USDT (BUY)", msg)
-        self.assertIn("32.50 USDT", msg)
-        self.assertIn("Exit: TP2", msg)
+        self.assertIn("BARON — TRADE CLOSED", msg)
+        self.assertIn("BTC/USDT:USDT", msg)
+        self.assertIn("Side: BUY", msg)
+        self.assertIn("+32.5000 USDT", msg)
+        self.assertIn("TP2", msg)
         self.assertIn("TRD-42", msg)
+        self.assertIn("VERIFIED CLOSED", msg)
 
     def test_external_close_sync_routes_through_finalize_before_cleanup(self):
         E = self.E

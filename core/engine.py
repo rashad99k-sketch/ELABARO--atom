@@ -257,8 +257,6 @@ except Exception as _ext_intel_err:  # pragma: no cover
     EXTERNAL_INTELLIGENCE_AVAILABLE = False
     print("[EXT-INTEL] unavailable:", _ext_intel_err)
 
-from core.orderbook_heatmap import L2HeatmapEngine
-
 # ========== GLOBALS (FIX: MEMORY moved here) ==========
 MEMORY = {
     "candidates": [],
@@ -379,12 +377,6 @@ _ORDERBOOK_QUALITY = {}
 _ORDERBOOK_QUALITY_LOCK = threading.RLock()
 ORDERBOOK_CACHE_TTL_SEC = max(1.0, float(os.getenv("ORDERBOOK_CACHE_TTL_SEC", "5")))
 ORDERBOOK_STALE_MAX_SEC = max(ORDERBOOK_CACHE_TTL_SEC, float(os.getenv("ORDERBOOK_STALE_MAX_SEC", "30")))
-L2_HEATMAP = L2HeatmapEngine(
-    max_snapshots=int(os.getenv("L2_HISTORY_SNAPSHOTS", "24")),
-    wall_multiple=float(os.getenv("L2_WALL_MULTIPLE", "3.0")),
-    level_tolerance_bps=float(os.getenv("L2_LEVEL_TOLERANCE_BPS", "8")),
-    stale_after_sec=float(os.getenv("L2_STALE_AFTER_SEC", "15")),
-)
 
 def _classify_orderbook_error(exc):
     text = str(exc or "").lower()
@@ -547,12 +539,32 @@ def tg_tp_hit(symbol, tp_level, pnl_pct):
 def tg_sl_hit(symbol, pnl_pct):
     send_once(f"🛑 <b>STOP LOSS HIT</b> on {symbol}\nPnL: {pnl_pct:.2f}%", f"sl_{symbol}", 30)
 
-def tg_close(symbol, pnl_pct, duration_min, side, pnl_usdt=None, reason=None, trade_id=None):
-    icon = "✅" if pnl_pct >= 0 else "❌"
-    usdt_line = f"\n💰 PnL: {float(pnl_usdt):+.2f} USDT" if pnl_usdt is not None else ""
-    reason_line = f"\n📌 Exit: {str(reason)[:120]}" if reason else ""
-    tid_line = f"\n🆔 {str(trade_id)[:80]}" if trade_id else ""
-    send_once(f"{icon} <b>TRADE CLOSED — {('WIN' if pnl_pct >= 0 else 'LOSS')}</b> {symbol} ({side})\nReturn: {pnl_pct:+.2f}%{usdt_line}\n⏱ {duration_min:.0f} min{reason_line}{tid_line}", f"close_{trade_id or symbol}", 10)
+def tg_close(symbol, pnl_pct, duration_min, side, pnl_usdt=None, reason=None, trade_id=None,
+             entry=None, exit_price=None, liquidity="UNKNOWN", structure="UNKNOWN",
+             volume="UNKNOWN", flow="UNKNOWN", thesis="ACTIVE",
+             profit_secured="0%", runner="CLOSED", verified=True):
+    icon = "💎🟢" if pnl_pct >= 0 else "🔴📕"
+    _e = float(entry) if entry is not None else float(STATE.get("entry", 0.0) or 0.0)
+    _x = float(exit_price) if exit_price is not None else float(STATE.get("close_execution_price") or STATE.get("mark_price") or 0.0)
+    _pnl_usdt = float(pnl_usdt) if pnl_usdt is not None else 0.0
+    _reason = str(reason or STATE.get("close_reason") or "UNKNOWN").upper()
+    runner_state = "ACTIVE" if str(runner).upper() == "ACTIVE" else "CLOSED"
+    verified_state = "VERIFIED CLOSED" if verified else "UNVERIFIED"
+    msg = (
+        f"{icon} <b>BARON — TRADE CLOSED</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"💱 Symbol: {symbol}\n📊 Side: {side}\n🎯 Entry: {_e:.4f}\n🏁 Exit: {_x:.4f}\n\n"
+        f"💰 PnL: {_pnl_usdt:+.4f} USDT\n📈 ROE: {pnl_pct:+.2f}%\n\n"
+        f"🧲 Liquidity: {liquidity}\n📊 Structure: {structure}\n📦 Volume: {volume}\n🌊 Flow: {flow}\n🧠 Thesis: {thesis}\n\n"
+        f"🛡️ Exit Reason:\n{icon} {_reason}\n\n"
+        f"💎 Profit Secured: {profit_secured}\n🏃 Runner: {runner_state}\n\n"
+        f"✅ Position: {verified_state}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🤖 BARON TRADE MANAGEMENT"
+    )
+    if trade_id:
+        msg += f"\n🆔 {str(trade_id)[:60]}"
+    send_once(msg, f"close_{trade_id or symbol}", 10)
 
 def tg_error(err_msg, error_type="EXECUTION"):
     send_once(f"🚨 <b>ERROR</b> [{error_type}]\n{err_msg[:200]}", f"err_{error_type}_{err_msg[:50]}", 60)
@@ -562,12 +574,7 @@ API_KEY = os.getenv("BINGX_API_KEY", "")
 API_SECRET = os.getenv("BINGX_API_SECRET", "")
 PAPER_MODE = os.getenv("PAPER_MODE", "True").strip().lower() in {"1", "true", "yes", "on"}
 MODE_LIVE = bool(API_KEY and API_SECRET) and not PAPER_MODE
-# Exchange-native protection is advisory-only. Internal Risk Management
-# (synthetic/match SL, TP, partial, breakeven, trailing, thesis, emergency
-# exit) is the protection authority; native SL is NEVER a precondition for a
-# LIVE entry. REQUIRE_NATIVE_PROTECTION_LIVE is kept for backward-compatible
-# documentation but no longer gates any code path.
-REQUIRE_NATIVE_PROTECTION_LIVE = os.getenv("REQUIRE_NATIVE_PROTECTION_LIVE", "0").strip().lower() in {"1", "true", "yes", "on"}
+REQUIRE_NATIVE_PROTECTION_LIVE = os.getenv("REQUIRE_NATIVE_PROTECTION_LIVE", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 DEFAULT_SYMBOL = os.getenv("SYMBOL", "BTC/USDT")
 INTERVAL = os.getenv("INTERVAL", "15m")
@@ -581,7 +588,7 @@ QUEUE_MAX_SIZE = int(os.getenv("QUEUE_MAX_SIZE", "15"))
 QUEUE_RE_EVAL_INTERVAL = int(os.getenv("QUEUE_RE_EVAL_INTERVAL", "5"))
 QUEUE_PROMOTE_INTERVAL = int(os.getenv("QUEUE_PROMOTE_INTERVAL", "30"))
 
-GLOBAL_SCAN_INTERVAL = int(os.getenv("GLOBAL_SCAN_INTERVAL_SEC", "1200"))
+GLOBAL_SCAN_INTERVAL = int(os.getenv("GLOBAL_SCAN_INTERVAL_SEC", "900"))
 SCANNER_V2_INTERVAL = 60 * 15
 MICRO_SCAN_INTERVAL = 5
 TOP_LIQUID_COUNT = 80
@@ -900,11 +907,6 @@ def get_orderbook_cached(symbol, limit=20):
         ts = time.time()
         with _ORDERBOOK_CACHE_LOCK:
             _ORDERBOOK_CACHE[key] = {"value": ob, "ts": ts}
-        try:
-            l2 = L2_HEATMAP.update(symbol, ob, limit=limit, now=ts)
-            MEMORY.setdefault("l2_heatmap", {})[symbol] = l2
-        except Exception as _l2e:
-            log_execution(f"[L2] heatmap update error {symbol}: {_l2e}", "WARN", debounce_key=f"l2_{symbol}", debounce_sec=60)
         _set_orderbook_quality(symbol, "ORDERBOOK_OK", cache_hit=False, cache_age=0.0, latency_ms=latency_ms, last_success_ts=ts)
         return ob
 
@@ -3530,41 +3532,6 @@ class InstitutionalTradeBrain:
     def get_patience_level(self) -> str:
         return self.state_machine.get_patience_level()
 
-
-class UnifiedTradeManagementBrain:
-    """Single management decision authority.
-
-    Existing engines remain evidence providers. They can propose HOLD,
-    PROTECT, PARTIAL or CLOSE, but only this brain authorizes an execution
-    action. It intentionally contains no exchange calls.
-    """
-    VALID = {"HOLD", "PROTECT", "PARTIAL", "CLOSE"}
-
-    def decide(self, *, proposed: str = "HOLD", reason: str = "",
-               continuation_probability: float = 0.5, thesis_failed: bool = False,
-               distribution_risk: float = 0.0, roe: float = 0.0,
-               structure_aligned: bool = True, hard_failure: bool = False) -> dict:
-        proposed = str(proposed or "HOLD").upper()
-        if proposed not in self.VALID:
-            proposed = "HOLD"
-        if hard_failure or (thesis_failed and roe <= 0):
-            action = "CLOSE"
-        elif proposed == "CLOSE":
-            # Never close a healthy trend solely because a weak provider fired.
-            if structure_aligned and continuation_probability >= 0.62 and distribution_risk < 65 and roe > 0:
-                action = "PROTECT"
-            else:
-                action = "CLOSE"
-        else:
-            action = proposed
-        return {
-            "action": action, "reason": reason,
-            "continuation_probability": float(continuation_probability),
-            "thesis_failed": bool(thesis_failed),
-            "distribution_risk": float(distribution_risk),
-        }
-
-
 # ========== FIXED: ORDER VERIFICATION HELPER ==========
 def verify_order_filled(symbol, order_id, side, expected_qty, timeout=10):
     if PAPER_MODE:
@@ -3828,6 +3795,12 @@ def close_position_full(close_price=None, stage="FULL"):
     _reconciliation_pending = True
     _trade_event("CLOSE_REQUESTED", reason="MANAGEMENT", stage=str(stage).upper())
     try:
+        # Phase 2 (Decision 2): every full close must carry a REAL close_reason
+        # so the close notification and outcome memory never fall back to
+        # "UNKNOWN". Exit paths set an explicit reason before calling this; the
+        # stage-based default only covers legacy/uncalled paths.
+        if not STATE.get("close_reason"):
+            STATE["close_reason"] = "TP2" if str(stage).upper() == "TP2" else "MANAGEMENT"
         if PAPER_MODE:
             symbol = STATE.get("current_symbol") or DEFAULT_SYMBOL
             if close_price is not None:
@@ -4059,9 +4032,8 @@ def apply_50_50_profit_engine(df, idx, price, atr, side, entry, state, roe_pct, 
 
     return "HOLD", state["sl"], state["trail_stop"]
 
-# ========== REAL EXCHANGE ORDERS / NATIVE PROTECTION ==========
-# Entry/partial/full-close execution remains centralized; native protection is
-# reconciled separately by the protection service when LIVE mode requires it.
+# ========== REAL EXCHANGE ORDERS (ONLY ENTRY, PARTIAL, FULL CLOSE) ==========
+# No native SL/TP orders are sent.
 
 # ========== LIVE TRADE MANAGER WITH SYNTHETIC PROTECTION (FIXED) ==========
 class LiveTradeManager:
@@ -4081,7 +4053,6 @@ class LiveTradeManager:
         self.confidence_engine = ConfidenceEngine()
         self.regime_classifier = MarketRegimeClassifier()
         self.brain = InstitutionalTradeBrain()
-        self.unified_brain = UnifiedTradeManagementBrain()
         # Position Management Engine (Phase 1 advisory layer)
         self.position_profile = None
         self.health_engine = PositionHealthScore()
@@ -4094,23 +4065,6 @@ class LiveTradeManager:
         event_bus.subscribe("reconciled", self._on_reconciled)
         event_bus.subscribe("force_close_local", self._force_close)
         event_bus.subscribe("lifecycle_change", self._set_lifecycle)
-
-    def _brain_close(self, reason: str, *, continuation_probability: float = 0.5,
-                    thesis_failed: bool = False, distribution_risk: float = 0.0,
-                    roe: float = 0.0, structure_aligned: bool = True,
-                    hard_failure: bool = False) -> bool:
-        decision = self.unified_brain.decide(
-            proposed="CLOSE", reason=reason,
-            continuation_probability=continuation_probability,
-            thesis_failed=thesis_failed, distribution_risk=distribution_risk,
-            roe=roe, structure_aligned=structure_aligned, hard_failure=hard_failure,
-        )
-        STATE["management_brain_decision"] = decision
-        if decision["action"] != "CLOSE":
-            log_execution(f"[UTMB] CLOSE vetoed -> {decision['action']} | {reason}", "INFO")
-            return False
-        log_execution(f"[UTMB] AUTHORIZED CLOSE | {reason}", "WARN")
-        return bool(close_position_full())
 
     def _set_lifecycle(self, state):
         # Lifecycle events are accepted only by the manager already bound to
@@ -4169,6 +4123,7 @@ class LiveTradeManager:
         if self.symbol and STATE.get("current_symbol") not in (None, self.symbol):
             return
         if STATE.get("open") and (not target or STATE.get("current_symbol") == target):
+            STATE["close_reason"] = "FORCE_CLOSE_LOCAL"
             close_position_full()
             self.lifecycle_state = TradeLifecycleState.CLOSED
             DASHBOARD_STATE["live_trade_mode"] = False
@@ -4486,12 +4441,8 @@ class LiveTradeManager:
                     atr, {"score": health_score, "components": {}}, "EXIT",
                     "confirmed reversal (strong evidence)", confidence, force=True,
                 )
-                self._brain_close(
-                    "confirmed reversal (strong evidence)",
-                    continuation_probability=cont, thesis_failed=True,
-                    distribution_risk=dist_risk, roe=roe,
-                    structure_aligned=structure_aligned, hard_failure=True,
-                )
+                STATE["close_reason"] = "REVERSAL"
+                close_position_full()
                 return True
             elif (reversal_medium or combined_medium) and not STATE.get("tp1_hit", False) and roe > 0:
                 # Medium evidence before TP1 never executes a profit partial.
@@ -4529,28 +4480,29 @@ class LiveTradeManager:
                     "INFO"
                 )
 
-        # ---- Rule 3: ATR/asset-class / CORRECTION partial profit-taking -------
-        # Reversal & mean-reverting assets (GOLD/OIL) should bank profit sooner.
-        # A TREND/SNIPER trade entering a CORRECTION (continuation faded but not
-        # yet a distribution/exhaustion/failure) should bank a partial + protect
-        # the remainder (runner + breakeven) rather than hold the full position.
-        # When TP1 hasn't fired yet and ROE reaches the asset-class ATR target
-        # while continuation faded, take a partial and switch to runner.
+        # ---- Rule 3: CORRECTION partial profit protection --------------------
+        # Phase 2 (Decision 1): asset class (GOLD/OIL) or trade type
+        # (REVERSAL/RETEST) is NO LONGER a standalone early-profit authority.
+        # The market must not be left because of where it is quoted but only
+        # because of what the evidence says. Profit protection before the
+        # canonical TP1 fires ONLY on evidence of a real correction: faded
+        # continuation (cont < 0.62) AND the structure not aligned as the trade
+        # thesis expects. _is_correction() already excludes healthy pullbacks,
+        # strong trends, distribution/exhaustion and hard-failure regimes.
         if not STATE.get("dynamic_partial_done", False) and not STATE.get("tp1_hit", False):
             roe_target = float(asset_cfg.get("tp1_atr", 2.5)) * (atr / entry) * 100.0
-            early_reversal_profit = trade_type_cur in ("REVERSAL", "RETEST") or asset_class in ("GOLD", "OIL")
             is_correction = self._is_correction(
                 trade_state=trade_state, cont=cont, dist_risk=dist_risk,
                 exhaustion_risk=exhaustion_risk, momentum_decay=momentum_decay,
                 structure_aligned=structure_aligned)
-            if (early_reversal_profit or is_correction) and roe >= roe_target and cont < 0.62:
+            if is_correction and roe >= roe_target and cont < 0.62:
                 STATE["dynamic_partial_done"] = True
                 STATE["synthetic_sl"] = entry
                 STATE["sl"] = entry
                 STATE["profit_protection_reason"] = "EARLY_PROFIT_PROTECTION_WAIT_TP1"
                 log_execution(
-                    f"[DYNAMIC] Early profit protection ({trade_type_cur}/{asset_class}"
-                    f"{'/CORRECTION' if is_correction else ''}) "
+                    f"[DYNAMIC] Early profit protection (correction evidence: "
+                    f"cont={cont:.2f} structure_aligned={structure_aligned}) "
                     f"roe={roe:.2f}% >= {roe_target:.2f}% -> BE protection, canonical TP1 remains 50%",
                     "INFO"
                 )
@@ -4561,7 +4513,7 @@ class LiveTradeManager:
     def _compute_tp1_hold_score(self, smart: dict, momentum: dict, adx: float, adx_slope: float,
                                  trade_state: str, continuation_eval: ContinuationEvaluation,
                                  distribution_risk: float, rejection_detected: bool,
-                                 failed_breakout: bool, roe: float, liquidity_ahead: Optional[dict] = None) -> int:
+                                 failed_breakout: bool, roe: float) -> int:
         score = 0
         if smart.get("smart_money_dominant", False):
             score += 4
@@ -4601,19 +4553,6 @@ class LiveTradeManager:
             score -= 4
         if continuation_eval.continuation_probability < 0.45:
             score -= 5
-        # BARON Liquidity Ahead advisory: ride when major liquidity still lies
-        # a comfortable ATR runway away with healthy continuation; protect when
-        # price is inside a wall. Advisory only — regular scoring is authority.
-        _lq = liquidity_ahead if isinstance(liquidity_ahead, dict) else {}
-        if _lq.get("roadmap_valid") and _lq.get("nearest_distance_atr") is not None:
-            _nearest_atr = _lq["nearest_distance_atr"]
-            if (_lq.get("major_liquidity_ahead") and isinstance(_lq.get("major_target"), dict)
-                    and _nearest_atr >= 1.5 and not rejection_detected):
-                score += 3  # runway to a strong target: delay the TP1 give-back
-            elif _nearest_atr <= 0.4:
-                score -= 3  # at the wall: protect, do not chase the hold
-            elif _nearest_atr <= 0.2:
-                score -= 4  # inside the wall: bank the move, no ride
         # ROE penalty only applies if not in healthy continuation regimes
         if trade_state not in ("TREND_RIDE", "EXPANSION", "ACCUMULATION", "HEALTHY_PULLBACK"):
             if roe > 80:
@@ -4654,8 +4593,7 @@ class LiveTradeManager:
     # FIX: Healthy pullback vs distribution – do not tighten aggressively during HEALTHY_PULLBACK
     def _apply_runner_defense(self, roe: float, peak_roe: float, drawdown: float,
                                exit_warning: int, continuation_prob: float,
-                               trail_mult: float, trade_state: str,
-                               liquidity_ahead: Optional[dict] = None) -> float:
+                               trail_mult: float, trade_state: str) -> float:
         mult = trail_mult
         if STATE.get("tp1_hit", False):
             mult *= 0.9
@@ -4673,16 +4611,6 @@ class LiveTradeManager:
                     mult *= 0.6
             if continuation_prob < 0.55:
                 mult *= 0.9
-            _lq = liquidity_ahead if isinstance(liquidity_ahead, dict) else {}
-            if (_lq.get("major_liquidity_ahead") and isinstance(_lq.get("major_target"), dict)
-                    and _lq.get("nearest_distance_atr") is not None
-                    and _lq["nearest_distance_atr"] >= 1.5
-                    and continuation_prob >= 0.62
-                    and trade_state in ("TREND_RIDE", "EXPANSION", "ACCUMULATION", "HEALTHY_PULLBACK")):
-                mult *= 1.1  # ride the runner into the major liquidity target
-            elif (_lq.get("roadmap_valid") and _lq.get("nearest_distance_atr") is not None
-                  and _lq["nearest_distance_atr"] <= 0.4):
-                mult *= 0.85  # at a liquidity wall: protect the runner
         return max(0.5, min(4.0, mult))
 
     def _update_peak_profit(self, roe: float, price: float):
@@ -4844,15 +4772,6 @@ class LiveTradeManager:
             STATE["momentum_flow"] = momentum
             STATE["market_regime"] = regime
 
-            # Live refresh of the BARON Liquidity-Ahead roadmap (every heavy tick).
-            # Advisory, fail-open: missing judge/data leaves the prior roadmap.
-            STATE["liquidity_ahead_ctx"] = _baron_liquidity_ahead_ctx(
-                df_live if isinstance(df_live, pd.DataFrame) else None, side, mark_price, atr)
-            if not STATE["liquidity_ahead_ctx"].get("targets"):
-                STATE["liquidity_ahead_ctx"] = dict(STATE.get("liquidity_ahead_ctx", {}),
-                                                    **{"targets": [], "roadmap_valid": False})
-            STATE["liquidity_targets"] = STATE["liquidity_ahead_ctx"].get("targets", []) or []
-
             # ---- Phase-3 (G2/G7): advisory signal stack ----
             # RSI / MACD-histogram / volume-regime / VWAP context plus the
             # live OB-zone strength feed the advisory health and the dynamic
@@ -4928,7 +4847,8 @@ class LiveTradeManager:
                     STATE["profit_protection_reason"] = "THESIS_FAILURE_PROFIT_PROTECTED"
                     log_execution("[THESIS_FAILURE] Profit protected at breakeven; no pre-TP1 partial", "WARN")
                 else:
-                    self._brain_close("management_rule")
+                    STATE["close_reason"] = "THESIS_FAILURE"
+                    close_position_full()
                     self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
                     DASHBOARD_STATE["live_trade_mode"] = False
                     return
@@ -4948,8 +4868,7 @@ class LiveTradeManager:
             tp1_hold_score = self._compute_tp1_hold_score(
                 smart_money, momentum, adx_now, adx_slope, trade_state,
                 continuation_eval, smart_money.get("distribution_risk", 0),
-                rejection_detected, failed_breakout, roe,
-                liquidity_ahead=STATE.get("liquidity_ahead_ctx")
+                rejection_detected, failed_breakout, roe
             )
             STATE["tp1_hold_score"] = tp1_hold_score
 
@@ -5062,7 +4981,8 @@ class LiveTradeManager:
 
         if self.brain.should_hard_exit():
             log_execution(f"[HARD_EXIT] Hard exit triggered (state={trade_state})", "ERROR")
-            self._brain_close("management_rule")
+            STATE["close_reason"] = "HARD_EXIT"
+            close_position_full()
             self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
             DASHBOARD_STATE["live_trade_mode"] = False
             return
@@ -5094,7 +5014,8 @@ class LiveTradeManager:
                 _set_protection_status("UNPROTECTED", reason=str(_np_exc))
         if (side == "BUY" and mark_price <= synthetic_sl) or (side == "SELL" and mark_price >= synthetic_sl):
             log_execution(f"[SYNTHETIC_SL] Hit at {mark_price:.4f} (SL={synthetic_sl:.4f})", "WARN")
-            self._brain_close("management_rule")
+            STATE["close_reason"] = "INTERNAL_SL"
+            close_position_full()
             self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
             DASHBOARD_STATE["live_trade_mode"] = False
             return
@@ -5121,14 +5042,7 @@ class LiveTradeManager:
         # Every TP order is submitted and verified by apply_profit_engine().
         # This prevents the manager from having a second independent TP path.
         STATE["mark_price"] = mark_price
-        tp_action = apply_profit_engine(
-            symbol, mark_price, df_live, len(df_live) - 1, STATE,
-            decision_authorizer=lambda reason: bool(self.unified_brain.decide(
-                proposed="CLOSE", reason=reason, continuation_probability=continuation_eval.continuation_probability,
-                distribution_risk=float(smart_money.get("distribution_risk", 0) or 0),
-                roe=roe, structure_aligned=structure_aligned, hard_failure=True
-            ).get("action") == "CLOSE")
-        )
+        tp_action = apply_profit_engine(symbol, mark_price, df_live, len(df_live) - 1, STATE)
         if tp_action == "TP2":
             self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
             DASHBOARD_STATE["live_trade_mode"] = False
@@ -5143,8 +5057,7 @@ class LiveTradeManager:
             base_trail_mult = self.brain.get_trail_multiplier()
             adjusted_mult = self._apply_runner_defense(roe, peak_roe, drawdown, exit_warning,
                                                         continuation_eval.continuation_probability,
-                                                        base_trail_mult, trade_state,
-                                                        liquidity_ahead=STATE.get("liquidity_ahead_ctx"))
+                                                        base_trail_mult, trade_state)
             STATE["smart_trail_mult"] = adjusted_mult
 
         trail_mult = STATE.get("smart_trail_mult", 1.5)
@@ -5198,7 +5111,8 @@ class LiveTradeManager:
                     STATE["trail_stop"] = new_trail
             if (side == "BUY" and mark_price <= STATE.get("trail_stop", 0)) or (side == "SELL" and mark_price >= STATE.get("trail_stop", float('inf'))):
                 log_execution(f"[TRAIL] Stop hit at {mark_price:.4f} (trail={STATE['trail_stop']:.4f})", "WARN")
-                self._brain_close("management_rule")
+                STATE["close_reason"] = "RUNNER_EXIT" if STATE.get("runner_mode", False) or STATE.get("tp1_hit", False) else "TRAILING_STOP"
+                close_position_full()
                 self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
                 DASHBOARD_STATE["live_trade_mode"] = False
                 return
@@ -5231,7 +5145,8 @@ class LiveTradeManager:
             )
             if action == "EXIT" and state_ppe.get("smart_money", {}).get("distribution_risk", 0) > 65 and momentum.get("momentum_decay", False):
                 log_execution("[PPE] Institutional exit signal – closing position", "WARN")
-                self._brain_close("management_rule")
+                STATE["close_reason"] = "INSTITUTIONAL_EXIT"
+                close_position_full()
                 self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
                 DASHBOARD_STATE["live_trade_mode"] = False
                 return
@@ -5257,7 +5172,8 @@ class LiveTradeManager:
         publish_position_state(symbol, side, entry, STATE.get("qty", 0.0), roe)
 
         if (side == "BUY" and mark_price <= STATE.get("synthetic_sl", 0)) or (side == "SELL" and mark_price >= STATE.get("synthetic_sl", 0)):
-            self._brain_close("management_rule")
+            STATE["close_reason"] = "INTERNAL_SL"
+            close_position_full()
             self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
             DASHBOARD_STATE["live_trade_mode"] = False
             return
@@ -5841,7 +5757,7 @@ def decision_engine(scenario, rf_signal, adx):
         return "STRONG"
     return "SKIP"
 
-def apply_profit_engine(symbol, current_price, df, idx, position_state, decision_authorizer=None):
+def apply_profit_engine(symbol, current_price, df, idx, position_state):
     """Canonical two-stage profit-taking adapter.
 
     TP1 is always exactly 50% of the ORIGINAL position. TP2 closes the
@@ -5902,24 +5818,22 @@ def apply_profit_engine(symbol, current_price, df, idx, position_state, decision
             atr_val = price * 0.01
         position_state["trail_stop"] = price - TRAIL_ATR_MULT * atr_val if side == "BUY" else price + TRAIL_ATR_MULT * atr_val
         log_execution(f"TP1 EXECUTED at {price:.6f} target={tp1:.6f} | closed 50%", "SUCCESS")
-        tg_tp_hit(symbol, 1, pnl_pct)
         return "TP1"
 
     if position_state.get("tp1_hit", False) and not position_state.get("tp2_hit", False) and valid_tp2:
         # TP2 = the entire remaining position (the other 50%). This is a FULL
         # close, not a second 30% partial, so the exchange and accounting end at
         # exactly zero quantity.
-        if decision_authorizer is not None:
-            _decision = decision_authorizer("TP2_TARGET_REACHED")
-            if not _decision:
-                return "HOLD"
+        # TP2 is a FULL close -> the single professional close notification is sent
+        # by finalize_trade_with_reality() AFTER exchange verification. Intro-
+        # duce no second partial-style TP2 message here (Decision 2).
+        position_state["close_reason"] = "TP2"
         _tp2_ok = bool(close_position_full(close_price=price, stage="TP2"))
         if not _tp2_ok:
             _trade_event("TP2_EXECUTION_FAILED", reason="FULL_CLOSE_NOT_VERIFIED", target=tp2)
             return "HOLD"
         position_state["tp2_hit"] = True
         log_execution(f"TP2 EXECUTED at {price:.6f} target={tp2:.6f} | closed remaining 50%", "SUCCESS")
-        tg_tp_hit(symbol, 2, pnl_pct)
         return "TP2"
     # TP1/TP2 are the only execution responsibilities of this adapter.
     # Runner trailing, SL, thesis exits and institutional exits remain in the
@@ -6491,9 +6405,7 @@ STATE = {
     "evidence_bus": {},
     "data_quality": "UNKNOWN",
     "setup_edge": {"available": False, "score": None, "samples": 0},
-    "institutional_stage": None,
-    "liquidity_targets": [],
-    "liquidity_ahead_ctx": {}
+    "institutional_stage": None
 }
 paper = {"balance": 10000.0, "position": None, "committed_margin": 0.0}
 _ACTIVE_TRADE = False
@@ -7313,9 +7225,46 @@ def finalize_trade_with_reality(symbol):
     DASHBOARD_STATE["live_trade_mode"] = False
     log_execution(f"Trade closed: {result} {pnl_pct:.2f}% | USDT: {pnl_usdt:+.2f}", "SUCCESS" if pnl_pct>=0 else "ERROR")
     entry_time = _close_entry_time
+    # Phase 2 (Decision 2): the ONE close notification. Built only here, after
+    # finalize has the verified execution price and real booked PnL, so it
+    # always reflects the actual closed position - never a placeholder.
+    _dfx = None
+    try:
+        _dfx = get_ohlcv_safe(symbol, 50)
+    except Exception:
+        _dfx = None
+    _liq = "UNKNOWN"
+    if _dfx is not None and len(_dfx) > 10:
+        try:
+            _liq_ctx = detect_liquidity_context(_dfx, lookback=10)
+            if _liq_ctx == "sell_side_taken":
+                _liq = "LIQUIDITY REACHED (LOW SIDE)"
+            elif _liq_ctx == "buy_side_taken":
+                _liq = "LIQUIDITY REACHED (HIGH SIDE)"
+            elif _liq_ctx:
+                _liq = str(_liq_ctx).replace("_", " ").upper()
+            else:
+                _liq = "NEUTRAL"
+        except Exception:
+            _liq = "UNKNOWN"
+    _struct_raw = str(STATE.get("advisory_struct_shift") or "none").lower()
+    _struct = "BEARISH" if "bearish" in _struct_raw else ("BULLISH" if "bullish" in _struct_raw else "NEUTRAL")
+    _vol = str(STATE.get("position_vol_state") or "UNKNOWN").upper()
+    _smart = STATE.get("smart_money") or {}
+    _flow = str(_smart.get("institutional_bias_detailed") or _smart.get("institutional_bias") or "NEUTRAL")
+    _tf = float(STATE.get("thesis_failure_score", 0) or 0)
+    _thesis = "FAILED" if _tf >= 50 else ("STRAINED" if _tf >= 30 else "ACTIVE")
+    _secured = "50%" if STATE.get("tp1_hit") else "0%"
+    _runner = "ACTIVE" if STATE.get("runner_mode") else "CLOSED"
+    _entry = STATE.get("entry")
+    _exit_px = STATE.get("close_execution_price") or mark_price
     tg_close(symbol or "UNKNOWN", pnl_pct,
              max(0.0, (time.time() - entry_time)) / 60.0, _close_side,
-             pnl_usdt=pnl_usdt, reason=_close_reason, trade_id=_close_tid)
+             pnl_usdt=pnl_usdt, reason=_close_reason, trade_id=_close_tid,
+             entry=_entry, exit_price=_exit_px,
+             liquidity=_liq, structure=_struct, volume=_vol, flow=_flow,
+             thesis=_thesis, profit_secured=_secured, runner=_runner,
+             verified=True)
     with _TRADE_LOCK:
         STATE["open"] = False
         STATE["side"] = None
@@ -7717,12 +7666,9 @@ def check_institutional_entry(symbol, side, df, ob, atr, price):
             _maturity = classify_move_maturity(df.iloc[:-1] if len(df) > 40 else df, float(compute_atr(df).iloc[-1]))
             STATE["move_maturity"] = _maturity
             if _maturity in ("LATE_EXPANSION", "EXHAUSTION"):
-                # No entry score exists yet at this stage; keep the blocker
-                # diagnostic numeric and deterministic rather than referencing
-                # an uninitialised local.
-                _record_exec_blocker(symbol, "ENTRY_QUALITY_REJECT", f"move maturity={_maturity}", side, 0.0)
+                _record_exec_blocker(symbol, "ENTRY_QUALITY_REJECT", f"move maturity={_maturity}", side, score)
                 log_execution(f"[ENTRY] {symbol} rejected: {_maturity} move is too mature", "WARN")
-                return False, None, f"Move maturity={_maturity}"
+                return False
         except Exception as _mat_err:
             log_execution(f"[MATURITY] {symbol} validation unavailable: {_mat_err}", "WARN")
     reasons = []
@@ -7800,64 +7746,6 @@ def check_institutional_entry(symbol, side, df, ob, atr, price):
         except Exception:
             pass
 
-    # ------------------------------------------------------------------
-    # BARON x Cowboy surgical entry upgrade
-    # ------------------------------------------------------------------
-    # The uploaded Cowboy playbook is used only to tighten the *entry geometry*:
-    # sweep -> directional structure -> causal zone -> local retest/reaction ->
-    # anti-chase.  It does not replace BARON's scanner, portfolio, risk, queue,
-    # execution, or management authorities.
-    cowboy_max_zone_atr = float(os.getenv("COWBOY_MAX_ZONE_DISTANCE_ATR", "1.25"))
-    cowboy_zone_distance_atr = 999.0
-    cowboy_zone_local = False
-    cowboy_retest = retest in ("RETEST_CONFIRMED", "MICRO_PULLBACK")
-    cowboy_response = bool(disp)
-    cowboy_zone_score = float(zone.get("score", 0) or 0)
-    cowboy_zone_source = "TRADE_INTELLIGENCE" if zone_valid and zone else "NONE"
-
-    # Prefer the causal zone returned by TradeIntelligence. Fallback zones are
-    # still accepted, but they must be physically close to the live price.
-    if zone.get("low") and zone.get("high"):
-        try:
-            zl = float(zone["low"]); zh = float(zone["high"])
-            if zl <= price <= zh:
-                cowboy_zone_distance_atr = 0.0
-                cowboy_zone_local = True
-            else:
-                cowboy_zone_distance_atr = min(abs(price-zl), abs(price-zh)) / max(float(atr), 1e-12)
-                cowboy_zone_local = cowboy_zone_distance_atr <= cowboy_max_zone_atr
-        except Exception:
-            pass
-    elif fallback_zone_price:
-        cowboy_zone_source = "ENGINE_FALLBACK_ZONE"
-        cowboy_zone_distance_atr = abs(price - float(fallback_zone_price)) / max(float(atr), 1e-12)
-        cowboy_zone_local = cowboy_zone_distance_atr <= cowboy_max_zone_atr
-    elif fvg and zone_valid:
-        # An FVG is a valid zone only when the live price is actually inside
-        # that same directional imbalance; existence of an FVG elsewhere on
-        # the chart is not enough to justify an entry.
-        try:
-            _fv = detect_fvg(df)
-            if _fv and ((side == "BUY" and _fv[0] == "bullish") or
-                        (side == "SELL" and _fv[0] == "bearish")):
-                _fl, _fh = float(_fv[1]), float(_fv[2])
-                if _fl <= float(price) <= _fh:
-                    cowboy_zone_source = "FVG"
-                    cowboy_zone_local = True
-                    cowboy_zone_distance_atr = 0.0
-        except Exception:
-            pass
-
-    # A retest is satisfied by an actual causal-zone retest OR by a live
-    # reaction/displacement while price is still inside/near that same zone.
-    # Resolve the canonical fallback evidence FIRST, then apply the Cowboy
-    # sequence gate. Otherwise a missing optional enrichment flag could reject
-    # a setup whose deterministic displacement/rejection detector confirms it.
-    try:
-        cowboy_response = bool(cowboy_response or candle_rejection(df, side))
-    except Exception:
-        pass
-
     if sweep:
         reasons.append("LIQUIDITY_SWEEP")
     if structure:
@@ -7909,35 +7797,11 @@ def check_institutional_entry(symbol, side, df, ob, atr, price):
 
     rejection = candle_rejection(df, side)
     if not (disp or rejection):
-        if cowboy_zone_local and not cowboy_retest:
-            return False, None, "Waiting for zone retest / local rejection"
         return False, None, "No displacement or rejection confirmation"
-    cowboy_response = bool(cowboy_response or disp or rejection)
     if disp:
         reasons.append("DISPLACEMENT")
     if rejection:
         reasons.append("REJECTION")
-
-    cowboy_retest_or_reaction = bool(cowboy_retest or (cowboy_zone_local and cowboy_response))
-    cowboy_sequence_ok = bool(sweep and structure and zone_valid and cowboy_zone_local and cowboy_retest_or_reaction)
-    STATE["cowboy_entry"] = {
-        "side": side,
-        "sweep": bool(sweep),
-        "structure": bool(structure),
-        "zone_valid": bool(zone_valid),
-        "zone_local": bool(cowboy_zone_local),
-        "zone_distance_atr": round(cowboy_zone_distance_atr, 3),
-        "zone_score": round(cowboy_zone_score, 2),
-        "zone_source": cowboy_zone_source,
-        "retest": bool(cowboy_retest),
-        "reaction_or_displacement": bool(cowboy_response),
-        "sequence_ok": bool(cowboy_sequence_ok),
-        "max_zone_distance_atr": cowboy_max_zone_atr,
-    }
-    if not cowboy_zone_local:
-        return False, None, f"Cowboy zone too far ({cowboy_zone_distance_atr:.2f} ATR > {cowboy_max_zone_atr:.2f})"
-    if not cowboy_retest_or_reaction:
-        return False, None, "Waiting for zone retest / local rejection"
 
     adx_series = compute_adx(df)
     adx_now = float(adx_series.iloc[-1]) if adx_series is not None and len(adx_series) else 0.0
@@ -7957,10 +7821,9 @@ def check_institutional_entry(symbol, side, df, ob, atr, price):
     # Anti-chase protection applies to both primary and fallback paths.
     if ti:
         timing = str(ti.get("timing", "WAIT_RETEST"))
-        _distance_raw = ev.get("distance_atr", None)
-        distance_atr = 999.0 if _distance_raw is None else float(_distance_raw)
-        if timing == "LATE_OR_DISTRIBUTION" or distance_atr > cowboy_max_zone_atr:
-            return False, None, "Entry is late / outside Cowboy zone window"
+        distance_atr = float(ev.get("distance_atr", 999) or 999)
+        if timing == "LATE_OR_DISTRIBUTION" or distance_atr > 2.5:
+            return False, None, "Entry is late / distribution-prone"
         if timing == "WAIT_RETEST" and not zone.get("in_zone", False) and distance_atr > 1.25:
             return False, None, "Waiting for zone mitigation/retest"
         score = float(ti.get("score", 0) or 0)
@@ -8371,32 +8234,6 @@ def _build_entry_setup_snapshot(symbol, side, df, price, atr, context=None):
         "hunter": copy.deepcopy(context.get("pro_hunter", {})) if isinstance(context.get("pro_hunter"), dict) else {},
     }
 
-def _baron_liquidity_ahead_ctx(df, side, price, atr):
-    """BARON Liquidity-Ahead advisory context (forward liquidity targets).
-
-    Pure advisory: provides the forward-liquidity roadmap used by trade
-    management (TP hold / runner ride vs protect). Fail-open: any error or
-    absent judge module returns an empty context and never blocks an entry.
-    """
-    empty = {"targets": [], "nearest": None, "nearest_distance_atr": None,
-             "major_liquidity_ahead": False, "major_target": None, "roadmap_valid": False}
-    try:
-        import baron_zone_judge as _jz
-        _fn = getattr(_jz, "forward_liquidity_map", None)
-        if _fn is None:
-            return empty
-        _roadmap = _fn(df, side=side, price=price, atr=atr)
-        if not isinstance(_roadmap, dict):
-            return empty
-        for _k in ("targets", "nearest", "nearest_distance_atr",
-                   "major_liquidity_ahead", "major_target", "roadmap_valid"):
-            if _k not in _roadmap:
-                _roadmap[_k] = empty[_k]
-        return _roadmap
-    except Exception as _lq_err:
-        log_execution(f"[LIQUIDITY_AHEAD] advisory ctx skipped: {_lq_err}", "WARN")
-        return empty
-
 def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, trade_type, entry_type, classification, context=None):
     """Final execution gate. Strategy intelligence decides *whether* the setup
     is institutionally mature; this function remains the sole order-entry
@@ -8760,16 +8597,6 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
     STATE["current_confidence"] = initial_conf
     STATE["market_regime"] = regime_class
 
-    # ---- BARON Liquidity Ahead (advisory, entry-time snapshot) -------------
-    # Forward-liquidity roadmap captured for the RUNNER decision: it tells the
-    # management layer whether major liquidity still lies ahead (ride) or the
-    # price is entering a wall (protect/take profit). Advisory only and
-    # fail-open: an unavailable judge or bad data yields an empty roadmap and
-    # never blocks an entry. The roadmap is refreshed live every management tick.
-    STATE["liquidity_ahead_ctx"] = _baron_liquidity_ahead_ctx(
-        df_local if isinstance(df_local, pd.DataFrame) else None, side, price, atr_local)
-    STATE["liquidity_targets"] = STATE["liquidity_ahead_ctx"].get("targets", []) or []
-
     # ---- Execute trade ----
     if PAPER_MODE:
         paper["position"] = {"side": side, "entry": price, "qty": qty, "remaining_qty": qty}
@@ -8818,6 +8645,14 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "tp1_hit": False, "trail_on": False, "last_update_ts": time.time()
         })
         _live_manager.start_trade(symbol, side, price, qty, sl, tp1, tp2, STATE.get("trade_id"))
+        if MODE_LIVE and REQUIRE_NATIVE_PROTECTION_LIVE and str(STATE.get("protection_status", "")).upper() != "PROTECTED":
+            log_execution(f"[LIVE_SAFETY] {symbol} entry rolled back: native SL was not confirmed", "ERROR")
+            try:
+                STATE["close_reason"] = "ENTRY_ROLLBACK"
+                close_position_full()
+            except Exception as _rollback_exc:
+                log_execution(f"[LIVE_SAFETY] protection rollback close failed: {_rollback_exc}", "ERROR")
+            return False
         _live_manager.set_entry_atr(atr_local)
         _live_manager._ensure_position_profile(symbol, price, side, atr_local,
                                                classification=classification,
@@ -8841,9 +8676,12 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         log_execution(f"[EXECUTION] {symbol} {side} executed (paper) at {price:.4f}", "SUCCESS")
         return True
 
-    # Exchange-native protection is NOT required for LIVE entries (deliberate:
-    # internal risk management is the protection authority). Native SL adapter,
-    # when enabled, still re-arms/updates/cancels during management below.
+    if MODE_LIVE and REQUIRE_NATIVE_PROTECTION_LIVE:
+        if _NATIVE_PROTECTION is None or not getattr(_NATIVE_PROTECTION, "enabled", False):
+            log_execution(f"[LIVE_SAFETY] {symbol} blocked: exchange-native protection is required for LIVE entries", "ERROR")
+            _record_exec_blocker(symbol, "PROTECTION_REQUIRED", "ENABLE_NATIVE_PROTECTION must be enabled for live entries", side, score, adx=adx_val)
+            return False
+
     sym = normalize_symbol(symbol)
     market = ex.market(sym)
     min_qty = market['limits']['amount']['min']
@@ -11643,6 +11481,7 @@ def manual_close():
     if not STATE["open"]:
         return jsonify({"error": "No position"}),400
     price = get_ticker_safe(STATE["current_symbol"])
+    STATE["close_reason"] = "MANUAL_CLOSE"
     if price:
         finalize_trade_with_reality(STATE["current_symbol"])
     else:
@@ -12255,6 +12094,7 @@ def main_loop_sniper():
                         update_position_dashboard(sym, STATE["side"], STATE["entry"], STATE["qty"], current_pnl)
             if emergency_kill_switch_active():
                 if STATE["open"]:
+                    STATE["close_reason"] = "EMERGENCY_EXIT"
                     close_position_full()
                     clear_position_dashboard()
                     TRADE_STATE["in_position"] = False
@@ -13399,12 +13239,6 @@ class InstitutionalRadar:
         return max(5, interval)
 
     def _update_symbol(self, symbol, entry):
-        # Initialize the analysis timestamp before any evidence engine can emit
-        # a trigger/expansion event. This keeps latency telemetry causal on the
-        # first evaluation pass and in deterministic paper-test providers.
-        if not entry.get("institutional_analysis_time"):
-            entry["institutional_analysis_time"] = time.time()
-            entry["institutional_analysis_logged"] = True
         df = get_ohlcv_safe(symbol, 100)
         if not is_valid_dataframe(df):
             return
@@ -13438,8 +13272,9 @@ class InstitutionalRadar:
                 f"[RADAR] {symbol} state: {old_state} → {new_state} (score={score:.1f}, accel={acceleration:.1f})",
                 "INFO"
             )
-        if not entry.get("institutional_analysis_log_emitted"):
-            entry["institutional_analysis_log_emitted"] = True
+        if not entry.get("institutional_analysis_logged"):
+            entry["institutional_analysis_time"] = time.time()
+            entry["institutional_analysis_logged"] = True
             log_execution(f"[INSTITUTION] {symbol} analysis started | score={score:.1f} status={status}", "INFO")
 
         # The TradingView evidence engine needs deeper history (EMA200 / HTF):

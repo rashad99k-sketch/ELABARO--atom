@@ -1239,7 +1239,6 @@ def data():
             "top5": top5,
             "candidates": MEMORY.get("top_candidates", []),
             "deep_radar": MEMORY.get("deep_radar", [])[:50],
-            "l2_heatmap": safe_json(_normalize_payload(MEMORY.get("l2_heatmap", {}))),
             "deep_scanner_last_scan": MEMORY.get("deep_scanner_last_scan", 0),
             "scanned_count": int(MEMORY.get("scanned_count", MEMORY.get("deep_discovery_count", 0))),
              "universe_size": int(MEMORY.get("deep_universe_size", 0)),

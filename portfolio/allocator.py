@@ -23,18 +23,20 @@ import os
 from portfolio.manager import PortfolioManager
 
 
-# The global portfolio contract is 5 technical + 1 NEWS. Class caps are
-# deliberately non-binding so the strongest five technical candidates can be
-# selected regardless of asset class. NEWS remains a hard singleton.
+# Class caps are expressed in counts (not score) to prevent a single class
+# from consuming all open positions, while remaining intentionally loose.
+#
+# 6-slot technical distribution: 2 Crypto + 2 Index + 1 Gold + 1 Oil.
+# The NEWS cap is fully independent: a news-driven position never consumes a
+# technical class cap, and total open positions are still bounded by
+# MAX_OPEN_POSITIONS (default 6).
+# Asset classes outside this market model (e.g. STOCK) have no slot: they are
+# discovered and analyzed, but never consume a technical portfolio slot.
 DEFAULT_CLASS_CAPS = {
     "CRYPTO": 2,
     "INDEX": 2,
     "GOLD": 1,
     "OIL": 1,
-    "STOCK": 1,
-    "ENERGY": 1,
-    "METALS": 1,
-    "COMMODITIES": 1,
     "NEWS": 1,
 }
 TECHNICAL_CLASSES = {"CRYPTO", "INDEX", "GOLD", "OIL", "STOCK", "ENERGY", "METALS", "COMMODITIES"}

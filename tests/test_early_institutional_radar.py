@@ -186,7 +186,7 @@ class EarlyInstitutionalRadarTest(unittest.TestCase):
         LOGS.clear()
         sys.modules["core.engine"].MEMORY = {"watchlist": {}, "pipeline": {}}
 
-    def _scanner(self, markets, watchlist=40, **kw):
+    def _scanner(self, markets, watchlist=60, **kw):
         scanner = self.DeepScanner(max_symbols=watchlist)
         scanner.exchange = FakeExchange(markets)
         scanner._market_loader = lambda: markets
@@ -203,8 +203,8 @@ class EarlyInstitutionalRadarTest(unittest.TestCase):
             assert steps < max_steps, "radar cycle failed to converge"
         return steps
 
-    def test_cycle_seeds_40_near_ob_symbols_within_window(self):
-        scanner = self._scanner(_markets(100, 160), watchlist=40,
+    def test_cycle_seeds_60_near_ob_symbols_within_window(self):
+        scanner = self._scanner(_markets(100, 160), watchlist=60,
                                 radar_max_calls_per_min=100000)
         scanner.radar_symbols = 0
         scanner.radar_batch_size = 20
@@ -212,7 +212,7 @@ class EarlyInstitutionalRadarTest(unittest.TestCase):
         # 260 rows in batches of 20 -> 13 advances, not one blocking pass.
         self.assertEqual(steps, 12)
         watch = scanner.last_result
-        self.assertEqual(len(watch), 40)
+        self.assertEqual(len(watch), 60)
         self.assertTrue(all(w["near_ob"] for w in watch))
         self.assertTrue(all("MOVE" in w["symbol"] for w in watch))
         self.assertEqual(scanner.status["radar_cycle"], "COMPLETE")
@@ -223,7 +223,7 @@ class EarlyInstitutionalRadarTest(unittest.TestCase):
         self.assertLess(scanner.stats["last_discovery"] - scanner.last_scan, 1.0)
 
     def test_scan_never_blocks_on_full_universe(self):
-        scanner = self._scanner(_markets(120, 120), watchlist=40)
+        scanner = self._scanner(_markets(120, 120), watchlist=60)
         scanner.radar_symbols = 0
         scanner.radar_batch_size = 20
         scanner.scan(force=True)
@@ -264,13 +264,13 @@ class EarlyInstitutionalRadarTest(unittest.TestCase):
         self.assertEqual(scanner.radar_cycle["cursor"], 2)
 
     def test_moving_market_selected_quiet_filtered(self):
-        scanner = self._scanner(_markets(60, 60), watchlist=40,
+        scanner = self._scanner(_markets(60, 60), watchlist=60,
                                 radar_max_calls_per_min=100000)
         scanner.radar_symbols = 0
         scanner.radar_batch_size = 24
         self._drive_to_completion(scanner)
         watch = scanner.last_result
-        self.assertEqual(len(watch), 40)
+        self.assertEqual(len(watch), 60)
         self.assertTrue(all("MOVE" in w["symbol"] for w in watch))
         self.assertTrue(all(w["near_ob"] for w in watch))
         # Only the moving-market rows are flagged near an institutional zone.
@@ -293,7 +293,7 @@ class EarlyInstitutionalRadarTest(unittest.TestCase):
         self.assertFalse(any(r["near_ob"] for r in radar if "QUIET" in r["symbol"]))
 
     def test_discovery_failure_keeps_watchlist_live(self):
-        scanner = self._scanner(_markets(20, 20), watchlist=40)
+        scanner = self._scanner(_markets(20, 20), watchlist=60)
         scanner.radar_symbols = 0
         scanner.radar_batch_size = 50
         top1 = scanner.scan(force=True)

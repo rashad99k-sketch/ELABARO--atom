@@ -550,7 +550,7 @@ def portfolio_loop(dashboard_module=None):
     last_watch_service = 0.0
     last_snapshot = 0.0
     last_queue_eval = 0.0
-    discovery_interval = float(os.getenv("GLOBAL_SCAN_INTERVAL_SEC", "1200"))
+    discovery_interval = float(os.getenv("GLOBAL_SCAN_INTERVAL_SEC", "900"))
     watch_interval = float(os.getenv("WATCHLIST_SERVICE_INTERVAL_SEC", "20"))
     snapshot_interval = float(os.getenv("SNAPSHOT_INTERVAL", "60"))
 

@@ -59,6 +59,19 @@ class PortfolioManager:
         if explicit:
             return str(explicit).upper()
         text = str(symbol or "").upper()
+        # Canonical tradfi prefix classification (single source of truth:
+        # scanner.universe.classify): NCSK->STOCK, NCSI->INDEX, NCCO->
+        # GOLD/OIL/METAL/ENERGY. Only metadata-confidence prefix hits are routed
+        # through the canonical classifier; every other symbol keeps the legacy
+        # hint behaviour below so CRYPTO remains the safe fallback.
+        if text.split("/")[0].startswith(("NCSI", "NCSK", "NCCO")):
+            try:
+                from scanner.universe import classify
+                _ac, _src, _conf = classify(str(symbol or ""), {})
+                if _src == "metadata" and _ac:
+                    return _ac
+            except Exception:
+                pass
         if any(x in text for x in ("XAU", "GOLD")):
             return "GOLD"
         if any(x in text for x in ("WTI", "BRENT", "OIL", "CRUDE")):
@@ -92,9 +105,9 @@ class PortfolioManager:
         if env:
             return max(1, int(env))
         from portfolio.allocator import DEFAULT_CLASS_CAPS
-        # Expanded asset classes receive one executable slot when capacity is
-        # available. The global technical ceiling remains the hard 5-position
-        # limit; NEWS remains a dedicated singleton.
+        # The six-market portfolio model is intentionally explicit. Classes
+        # outside that model (e.g. STOCK) may be discovered/scored upstream but
+        # are not eligible for these six execution slots.
         return int(DEFAULT_CLASS_CAPS.get(str(cls).upper(), 0))
 
     def _ctx_class(self, pos) -> str:
