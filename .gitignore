@@ -3,6 +3,9 @@
 .env.*
 !.env.example
 *.secret
+.secrets/
+db.sqlite3
+config/secrets.json
 
 # Virtual environments / caches
 .venv/
