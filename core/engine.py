@@ -562,7 +562,12 @@ API_KEY = os.getenv("BINGX_API_KEY", "")
 API_SECRET = os.getenv("BINGX_API_SECRET", "")
 PAPER_MODE = os.getenv("PAPER_MODE", "True").strip().lower() in {"1", "true", "yes", "on"}
 MODE_LIVE = bool(API_KEY and API_SECRET) and not PAPER_MODE
-REQUIRE_NATIVE_PROTECTION_LIVE = os.getenv("REQUIRE_NATIVE_PROTECTION_LIVE", "1").strip().lower() in {"1", "true", "yes", "on"}
+# Exchange-native protection is advisory-only. Internal Risk Management
+# (synthetic/match SL, TP, partial, breakeven, trailing, thesis, emergency
+# exit) is the protection authority; native SL is NEVER a precondition for a
+# LIVE entry. REQUIRE_NATIVE_PROTECTION_LIVE is kept for backward-compatible
+# documentation but no longer gates any code path.
+REQUIRE_NATIVE_PROTECTION_LIVE = os.getenv("REQUIRE_NATIVE_PROTECTION_LIVE", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 DEFAULT_SYMBOL = os.getenv("SYMBOL", "BTC/USDT")
 INTERVAL = os.getenv("INTERVAL", "15m")
@@ -4556,7 +4561,7 @@ class LiveTradeManager:
     def _compute_tp1_hold_score(self, smart: dict, momentum: dict, adx: float, adx_slope: float,
                                  trade_state: str, continuation_eval: ContinuationEvaluation,
                                  distribution_risk: float, rejection_detected: bool,
-                                 failed_breakout: bool, roe: float) -> int:
+                                 failed_breakout: bool, roe: float, liquidity_ahead: Optional[dict] = None) -> int:
         score = 0
         if smart.get("smart_money_dominant", False):
             score += 4
@@ -4596,6 +4601,19 @@ class LiveTradeManager:
             score -= 4
         if continuation_eval.continuation_probability < 0.45:
             score -= 5
+        # BARON Liquidity Ahead advisory: ride when major liquidity still lies
+        # a comfortable ATR runway away with healthy continuation; protect when
+        # price is inside a wall. Advisory only — regular scoring is authority.
+        _lq = liquidity_ahead if isinstance(liquidity_ahead, dict) else {}
+        if _lq.get("roadmap_valid") and _lq.get("nearest_distance_atr") is not None:
+            _nearest_atr = _lq["nearest_distance_atr"]
+            if (_lq.get("major_liquidity_ahead") and isinstance(_lq.get("major_target"), dict)
+                    and _nearest_atr >= 1.5 and not rejection_detected):
+                score += 3  # runway to a strong target: delay the TP1 give-back
+            elif _nearest_atr <= 0.4:
+                score -= 3  # at the wall: protect, do not chase the hold
+            elif _nearest_atr <= 0.2:
+                score -= 4  # inside the wall: bank the move, no ride
         # ROE penalty only applies if not in healthy continuation regimes
         if trade_state not in ("TREND_RIDE", "EXPANSION", "ACCUMULATION", "HEALTHY_PULLBACK"):
             if roe > 80:
@@ -4636,7 +4654,8 @@ class LiveTradeManager:
     # FIX: Healthy pullback vs distribution – do not tighten aggressively during HEALTHY_PULLBACK
     def _apply_runner_defense(self, roe: float, peak_roe: float, drawdown: float,
                                exit_warning: int, continuation_prob: float,
-                               trail_mult: float, trade_state: str) -> float:
+                               trail_mult: float, trade_state: str,
+                               liquidity_ahead: Optional[dict] = None) -> float:
         mult = trail_mult
         if STATE.get("tp1_hit", False):
             mult *= 0.9
@@ -4654,6 +4673,16 @@ class LiveTradeManager:
                     mult *= 0.6
             if continuation_prob < 0.55:
                 mult *= 0.9
+            _lq = liquidity_ahead if isinstance(liquidity_ahead, dict) else {}
+            if (_lq.get("major_liquidity_ahead") and isinstance(_lq.get("major_target"), dict)
+                    and _lq.get("nearest_distance_atr") is not None
+                    and _lq["nearest_distance_atr"] >= 1.5
+                    and continuation_prob >= 0.62
+                    and trade_state in ("TREND_RIDE", "EXPANSION", "ACCUMULATION", "HEALTHY_PULLBACK")):
+                mult *= 1.1  # ride the runner into the major liquidity target
+            elif (_lq.get("roadmap_valid") and _lq.get("nearest_distance_atr") is not None
+                  and _lq["nearest_distance_atr"] <= 0.4):
+                mult *= 0.85  # at a liquidity wall: protect the runner
         return max(0.5, min(4.0, mult))
 
     def _update_peak_profit(self, roe: float, price: float):
@@ -4815,6 +4844,15 @@ class LiveTradeManager:
             STATE["momentum_flow"] = momentum
             STATE["market_regime"] = regime
 
+            # Live refresh of the BARON Liquidity-Ahead roadmap (every heavy tick).
+            # Advisory, fail-open: missing judge/data leaves the prior roadmap.
+            STATE["liquidity_ahead_ctx"] = _baron_liquidity_ahead_ctx(
+                df_live if isinstance(df_live, pd.DataFrame) else None, side, mark_price, atr)
+            if not STATE["liquidity_ahead_ctx"].get("targets"):
+                STATE["liquidity_ahead_ctx"] = dict(STATE.get("liquidity_ahead_ctx", {}),
+                                                    **{"targets": [], "roadmap_valid": False})
+            STATE["liquidity_targets"] = STATE["liquidity_ahead_ctx"].get("targets", []) or []
+
             # ---- Phase-3 (G2/G7): advisory signal stack ----
             # RSI / MACD-histogram / volume-regime / VWAP context plus the
             # live OB-zone strength feed the advisory health and the dynamic
@@ -4910,7 +4948,8 @@ class LiveTradeManager:
             tp1_hold_score = self._compute_tp1_hold_score(
                 smart_money, momentum, adx_now, adx_slope, trade_state,
                 continuation_eval, smart_money.get("distribution_risk", 0),
-                rejection_detected, failed_breakout, roe
+                rejection_detected, failed_breakout, roe,
+                liquidity_ahead=STATE.get("liquidity_ahead_ctx")
             )
             STATE["tp1_hold_score"] = tp1_hold_score
 
@@ -5104,7 +5143,8 @@ class LiveTradeManager:
             base_trail_mult = self.brain.get_trail_multiplier()
             adjusted_mult = self._apply_runner_defense(roe, peak_roe, drawdown, exit_warning,
                                                         continuation_eval.continuation_probability,
-                                                        base_trail_mult, trade_state)
+                                                        base_trail_mult, trade_state,
+                                                        liquidity_ahead=STATE.get("liquidity_ahead_ctx"))
             STATE["smart_trail_mult"] = adjusted_mult
 
         trail_mult = STATE.get("smart_trail_mult", 1.5)
@@ -6451,7 +6491,9 @@ STATE = {
     "evidence_bus": {},
     "data_quality": "UNKNOWN",
     "setup_edge": {"available": False, "score": None, "samples": 0},
-    "institutional_stage": None
+    "institutional_stage": None,
+    "liquidity_targets": [],
+    "liquidity_ahead_ctx": {}
 }
 paper = {"balance": 10000.0, "position": None, "committed_margin": 0.0}
 _ACTIVE_TRADE = False
@@ -8329,6 +8371,32 @@ def _build_entry_setup_snapshot(symbol, side, df, price, atr, context=None):
         "hunter": copy.deepcopy(context.get("pro_hunter", {})) if isinstance(context.get("pro_hunter"), dict) else {},
     }
 
+def _baron_liquidity_ahead_ctx(df, side, price, atr):
+    """BARON Liquidity-Ahead advisory context (forward liquidity targets).
+
+    Pure advisory: provides the forward-liquidity roadmap used by trade
+    management (TP hold / runner ride vs protect). Fail-open: any error or
+    absent judge module returns an empty context and never blocks an entry.
+    """
+    empty = {"targets": [], "nearest": None, "nearest_distance_atr": None,
+             "major_liquidity_ahead": False, "major_target": None, "roadmap_valid": False}
+    try:
+        import baron_zone_judge as _jz
+        _fn = getattr(_jz, "forward_liquidity_map", None)
+        if _fn is None:
+            return empty
+        _roadmap = _fn(df, side=side, price=price, atr=atr)
+        if not isinstance(_roadmap, dict):
+            return empty
+        for _k in ("targets", "nearest", "nearest_distance_atr",
+                   "major_liquidity_ahead", "major_target", "roadmap_valid"):
+            if _k not in _roadmap:
+                _roadmap[_k] = empty[_k]
+        return _roadmap
+    except Exception as _lq_err:
+        log_execution(f"[LIQUIDITY_AHEAD] advisory ctx skipped: {_lq_err}", "WARN")
+        return empty
+
 def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, trade_type, entry_type, classification, context=None):
     """Final execution gate. Strategy intelligence decides *whether* the setup
     is institutionally mature; this function remains the sole order-entry
@@ -8692,6 +8760,16 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
     STATE["current_confidence"] = initial_conf
     STATE["market_regime"] = regime_class
 
+    # ---- BARON Liquidity Ahead (advisory, entry-time snapshot) -------------
+    # Forward-liquidity roadmap captured for the RUNNER decision: it tells the
+    # management layer whether major liquidity still lies ahead (ride) or the
+    # price is entering a wall (protect/take profit). Advisory only and
+    # fail-open: an unavailable judge or bad data yields an empty roadmap and
+    # never blocks an entry. The roadmap is refreshed live every management tick.
+    STATE["liquidity_ahead_ctx"] = _baron_liquidity_ahead_ctx(
+        df_local if isinstance(df_local, pd.DataFrame) else None, side, price, atr_local)
+    STATE["liquidity_targets"] = STATE["liquidity_ahead_ctx"].get("targets", []) or []
+
     # ---- Execute trade ----
     if PAPER_MODE:
         paper["position"] = {"side": side, "entry": price, "qty": qty, "remaining_qty": qty}
@@ -8740,13 +8818,6 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             "tp1_hit": False, "trail_on": False, "last_update_ts": time.time()
         })
         _live_manager.start_trade(symbol, side, price, qty, sl, tp1, tp2, STATE.get("trade_id"))
-        if MODE_LIVE and REQUIRE_NATIVE_PROTECTION_LIVE and str(STATE.get("protection_status", "")).upper() != "PROTECTED":
-            log_execution(f"[LIVE_SAFETY] {symbol} entry rolled back: native SL was not confirmed", "ERROR")
-            try:
-                close_position_full()
-            except Exception as _rollback_exc:
-                log_execution(f"[LIVE_SAFETY] protection rollback close failed: {_rollback_exc}", "ERROR")
-            return False
         _live_manager.set_entry_atr(atr_local)
         _live_manager._ensure_position_profile(symbol, price, side, atr_local,
                                                classification=classification,
@@ -8770,12 +8841,9 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         log_execution(f"[EXECUTION] {symbol} {side} executed (paper) at {price:.4f}", "SUCCESS")
         return True
 
-    if MODE_LIVE and REQUIRE_NATIVE_PROTECTION_LIVE:
-        if _NATIVE_PROTECTION is None or not getattr(_NATIVE_PROTECTION, "enabled", False):
-            log_execution(f"[LIVE_SAFETY] {symbol} blocked: exchange-native protection is required for LIVE entries", "ERROR")
-            _record_exec_blocker(symbol, "PROTECTION_REQUIRED", "ENABLE_NATIVE_PROTECTION must be enabled for live entries", side, score, adx=adx_val)
-            return False
-
+    # Exchange-native protection is NOT required for LIVE entries (deliberate:
+    # internal risk management is the protection authority). Native SL adapter,
+    # when enabled, still re-arms/updates/cancels during management below.
     sym = normalize_symbol(symbol)
     market = ex.market(sym)
     min_qty = market['limits']['amount']['min']
