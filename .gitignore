@@ -1,6 +1,7 @@
 # Secrets — never commit credentials
 .env
 .env.*
+!.env.example
 *.secret
 
 # Virtual environments / caches
