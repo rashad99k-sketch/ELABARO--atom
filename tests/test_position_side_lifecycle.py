@@ -139,6 +139,7 @@ class LiveOrderLayerLifecycleTest(unittest.TestCase):
             mock.patch.object(engine, "close_position_full", _real_close_position_full),
             mock.patch.object(engine, "fetch_position",
                               side_effect=lambda *a, **k: self.pos_return),
+            mock.patch.object(engine, "fetch_position_status", side_effect=self._fps_stub),
             mock.patch.object(engine, "verify_order_filled",
                               return_value=(True, 0.05)),
             mock.patch.object(engine, "finalize_trade_with_reality", return_value=None),
@@ -147,6 +148,20 @@ class LiveOrderLayerLifecycleTest(unittest.TestCase):
         for p in self.patches:
             p.start()
         self.addCleanup(lambda: [p.stop() for p in self.patches])
+        # Scripted fetch_position_status results consumed in order for the
+        # verified full-close lifecycle. Empty -> delegate to pos_return.
+        self.fps = []
+
+    def _fps_stub(self, symbol, position_side=None):
+        if self.fps:
+            item = self.fps.pop(0)
+            if item is None:
+                return None, "NOT_FOUND"
+            return dict(item), "OK"
+        r = self.pos_return
+        if r is None:
+            return None, "NOT_FOUND"
+        return (dict(r) if isinstance(r, dict) else r), "OK"
 
     # ---- LONG lifecycle ----
     def test_long_full_lifecycle_position_side(self):
@@ -164,8 +179,9 @@ class LiveOrderLayerLifecycleTest(unittest.TestCase):
         self.assertEqual(partial["params"]["positionSide"], "LONG")
         self.assertNotIn("reduceOnly", partial["params"])
 
-        self.pos_return = None             # position gone -> FINAL CLOSE
         _state("BUY", qty=0.05)
+        # FINAL CLOSE LONG: venue leg verified present, then absent after fill.
+        self.fps = [{"contracts": 0.05, "side": "long"}, None]
         engine.close_position_full()       # FINAL CLOSE LONG
         final = self.fx.created[2]
         self.assertEqual(final["side"], "sell")
@@ -190,8 +206,9 @@ class LiveOrderLayerLifecycleTest(unittest.TestCase):
         self.assertEqual(partial["params"]["positionSide"], "SHORT")
         self.assertNotIn("reduceOnly", partial["params"])
 
-        self.pos_return = None             # position gone -> FINAL CLOSE
         _state("SELL", qty=0.05)
+        # FINAL CLOSE SHORT: venue leg verified present, then absent after fill.
+        self.fps = [{"contracts": 0.05, "side": "short"}, None]
         engine.close_position_full()       # FINAL CLOSE SHORT
         final = self.fx.created[2]
         self.assertEqual(final["side"], "buy")

@@ -138,6 +138,7 @@ class PositionSideCloseOrders(unittest.TestCase):
             mock.patch.object(engine, "close_partial", _real_close_partial),
             mock.patch.object(engine, "close_position_full", _real_close_position_full),
             mock.patch.object(engine, "fetch_position", return_value=None),
+            mock.patch.object(engine, "fetch_position_status", side_effect=self._fps_stub),
             mock.patch.object(engine, "verify_order_filled", return_value=(True, 0.05)),
             mock.patch.object(engine, "finalize_trade_with_reality", return_value=None),
             mock.patch.object(engine, "_exchange_sync"),
@@ -145,6 +146,17 @@ class PositionSideCloseOrders(unittest.TestCase):
         for p in self.patches:
             p.start()
         self.addCleanup(lambda: [p.stop() for p in self.patches])
+        # Scripted fetch_position_status results: entries are consumed in order
+        # (pre-order verify, then post-order verify). Empty -> NOT_FOUND.
+        self.fps = []
+
+    def _fps_stub(self, symbol, position_side=None):
+        if self.fps:
+            item = self.fps.pop(0)
+            if item is None:
+                return None, "NOT_FOUND"
+            return dict(item), "OK"
+        return None, "NOT_FOUND"
 
     # TEST 3 — CLOSE LONG (Hedge Mode: reduceOnly omitted)
     def test_close_partial_long(self):
@@ -164,23 +176,27 @@ class PositionSideCloseOrders(unittest.TestCase):
         self.assertEqual(rec["params"]["positionSide"], "SHORT")
         self.assertNotIn("reduceOnly", rec["params"])
 
-    # TEST 7 — FULL CLOSE LONG
+    # TEST 7 — FULL CLOSE LONG (verify-first: venue leg present -> order -> gone)
     def test_close_full_long(self):
         engine.STATE["side"] = "BUY"
-        engine.close_position_full()
+        self.fps = [{"symbol": "BTC/USDT:USDT", "side": "long", "contracts": 0.1}, None]
+        self.assertTrue(engine.close_position_full())
         rec = engine.ex.created[0]
         self.assertEqual(rec["side"], "sell")
         self.assertEqual(rec["params"]["positionSide"], "LONG")
         self.assertNotIn("reduceOnly", rec["params"])
+        self.assertFalse(engine.STATE["open"])
 
-    # TEST 8 — FULL CLOSE SHORT
+    # TEST 8 — FULL CLOSE SHORT (verify-first: venue leg present -> order -> gone)
     def test_close_full_short(self):
         engine.STATE["side"] = "SELL"
-        engine.close_position_full()
+        self.fps = [{"symbol": "BTC/USDT:USDT", "side": "short", "contracts": 0.1}, None]
+        self.assertTrue(engine.close_position_full())
         rec = engine.ex.created[0]
         self.assertEqual(rec["side"], "buy")
         self.assertEqual(rec["params"]["positionSide"], "SHORT")
         self.assertNotIn("reduceOnly", rec["params"])
+        self.assertFalse(engine.STATE["open"])
 
     # TEST 5 — PARTIAL CLOSE LONG keeps LONG
     def test_partial_close_long_position_side_stays_long(self):

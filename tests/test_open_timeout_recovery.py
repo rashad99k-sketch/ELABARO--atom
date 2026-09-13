@@ -374,9 +374,21 @@ class CloseAfterRecoveryTest(TimeoutRecoveryBase):
     """Scenario H: close path preserves Hedge PositionSide without reduceOnly."""
 
     @contextmanager
-    def _patch_close(self, pos_return):
+    def _patch_close(self, pos_return, fps_script=None):
+        def _fps(symbol, position_side=None):
+            if fps_script is not None:
+                if fps_script:
+                    item = fps_script.pop(0)
+                    if item is None:
+                        return None, "NOT_FOUND"
+                    return dict(item), "OK"
+                return None, "NOT_FOUND"
+            if pos_return is None:
+                return None, "NOT_FOUND"
+            return (dict(pos_return) if isinstance(pos_return, dict) else pos_return), "OK"
         with mock.patch.object(engine, "fetch_position",
                                side_effect=lambda *a, **k: pos_return), \
+             mock.patch.object(engine, "fetch_position_status", side_effect=_fps), \
              mock.patch.object(engine, "verify_order_filled",
                                return_value=(True, 0.05)), \
              mock.patch.object(engine, "finalize_trade_with_reality",
@@ -398,7 +410,7 @@ class CloseAfterRecoveryTest(TimeoutRecoveryBase):
         with self._patch_close(remaining):
             engine.close_partial(0.5)               # SELL + LONG (Hedge Mode)
         engine.STATE["remaining_qty"] = 0.05
-        with self._patch_close(None):
+        with self._patch_close(None, fps_script=[remaining, None]):
             engine.close_position_full()            # SELL + LONG (Hedge Mode)
 
         self.assertEqual(len(self.fx.created), 3)
@@ -433,7 +445,7 @@ class CloseAfterRecoveryTest(TimeoutRecoveryBase):
         with self._patch_close(remaining):
             engine.close_partial(0.5)               # BUY + SHORT (Hedge Mode)
         engine.STATE["remaining_qty"] = 0.1
-        with self._patch_close(None):
+        with self._patch_close(None, fps_script=[remaining, None]):
             engine.close_position_full()            # BUY + SHORT (Hedge Mode)
 
         self.assertEqual(len(self.fx.created), 3)

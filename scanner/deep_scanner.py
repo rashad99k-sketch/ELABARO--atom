@@ -1397,28 +1397,7 @@ class DeepScanner:
             # represents as INSTITUTIONAL ZONE ANALYSIS — Dynamic Candidates.
             # It runs on the same fresh Watchlist result, so there is no extra
             # 90-second radar wait and no dependency on the old main_loop_sniper.
-            try:
-                radar = getattr(self, "_institutional_radar", None)
-                if radar is None and hasattr(E, "InstitutionalRadar"):
-                    radar = E.InstitutionalRadar()
-                    self._institutional_radar = radar
-                if radar is not None and float(score) >= pre_strong_threshold and entry.get("pre_expansion_state") and len(precursor_evidence) >= 1:
-                    radar._update_a_grade_status(entry)
-                    radar._sync_institutional_zone_registry(sym, entry)
-                    if entry.get("institutional_zone_active"):
-                        E.log_execution(
-                            f"[PROMOTION] {sym} {strength} + precursor="
-                            f"{len(precursor_evidence)} -> INSTITUTIONAL_ZONE_ANALYSIS",
-                            "SUCCESS",
-                            debounce_key=f"inst_promotion_{sym}", debounce_sec=30,
-                        )
-            except Exception as exc:
-                self.stats["errors"] += 1
-                E.log_execution(
-                    f"[PROMOTION] {sym} fast institutional bridge failed: {exc}",
-                    "WARN",
-                    debounce_key=f"inst_promotion_error_{sym}", debounce_sec=120,
-                )
+            self._institutional_bridge(sym, entry, score, precursor_evidence, strength)
             return entry
         except Exception as exc:
             self.stats["errors"] += 1
@@ -1429,6 +1408,56 @@ class DeepScanner:
                 debounce_sec=120,
             )
             return None
+
+    def _institutional_bridge(self, sym, entry, score, precursor_evidence, strength):
+        """Publish a freshly deep-analyzed symbol into the Institutional Zone registry.
+
+        The OB/liquidity/structure EVALUATOR slot (``self._institutional_radar``)
+        is bound to the live ExecutionQueue because the queue owns the three
+        evaluator methods (``_select_strong_ob`` / ``_evaluate_liquidity`` /
+        ``_evaluate_structure``). The ExecutionQueue has NO registrar role: the
+        registry methods ``_update_a_grade_status`` / ``_sync_institutional_zone_registry``
+        live exclusively on ``InstitutionalRadar``. Registration therefore always
+        runs on a DEDICATED real ``InstitutionalRadar`` kept in its own slot
+        (``self._institutional_registrar``), never on the evaluator object.
+
+        The 2026-09-13 production audit found this broken: the bridge called the
+        evaluator object (``E.queue``), raised ``AttributeError`` inside
+        ``_analyze_symbol``, and the empty registry made ``promote_to_queue``
+        early-return so nothing ever reached the queue.
+        """
+        try:
+            registrar = getattr(self, "_institutional_registrar", None)
+            if registrar is None:
+                radar_cls = getattr(E, "InstitutionalRadar", None)
+                if radar_cls is None:
+                    raise RuntimeError("E.InstitutionalRadar missing: cannot register institutional zone")
+                registrar = radar_cls()
+                self._institutional_registrar = registrar
+            pre_strong_threshold = float(os.getenv("PRE_STRONG_SCORE", "6.0"))
+            if (float(score) < pre_strong_threshold
+                    or not entry.get("pre_expansion_state")
+                    or len(precursor_evidence) < 1):
+                return False
+            registrar._update_a_grade_status(entry)
+            registrar._sync_institutional_zone_registry(sym, entry)
+            if entry.get("institutional_zone_active"):
+                E.log_execution(
+                    f"[PROMOTION] {sym} {strength} + precursor="
+                    f"{len(precursor_evidence)} -> INSTITUTIONAL_ZONE_ANALYSIS",
+                    "SUCCESS",
+                    debounce_key=f"inst_promotion_{sym}", debounce_sec=30,
+                )
+                return True
+            return False
+        except Exception as exc:
+            self.stats["errors"] += 1
+            E.log_execution(
+                f"[PROMOTION] {sym} fast institutional bridge failed: {exc}",
+                "WARN",
+                debounce_key=f"inst_promotion_error_{sym}", debounce_sec=120,
+            )
+            return False
 
     def monitor_watchlist(self, force: bool = False) -> List[dict]:
         """Continuously deep-analyze a rotating batch of active watchlist symbols."""

@@ -927,11 +927,33 @@ def get_orderbook_cached(symbol, limit=20):
     return None
 
 # ========== EXCHANGE POSITION SYNC ==========
-def fetch_position_status(symbol):
+def _leg_of_position(pos):
+    """Map an exchange position payload to a hedge-mode leg (LONG/SHORT).
+
+    Accepts the raw 'side' values ccxt/bingx returns ('long'/'short',
+    'LONG'/'SHORT', 'BUY'/'SELL', 'buy'/'sell') plus the legacy position
+    direction vocabulary. Returns None when the payload has no decodable leg.
+    """
+    try:
+        raw = str((pos or {}).get("side", "") or "").upper()
+        if raw in ("LONG", "BUY"):
+            return "LONG"
+        if raw in ("SHORT", "SELL"):
+            return "SHORT"
+        return _hedge_position_side(raw)
+    except Exception:
+        return None
+
+
+def fetch_position_status(symbol, position_side=None):
     """Return (position, status). status is OK/NOT_FOUND/PAUSED/ERROR.
 
     PAUSED and ERROR are intentionally distinct from NOT_FOUND so callers never
     convert an exchange query failure into a false local close.
+
+    position_side (optional "LONG"/"SHORT") narrows the match to that hedge
+    leg. With no position_side the legacy symbol-only match is kept so existing
+    single-position callers behave exactly as before.
     """
     if PAPER_MODE:
         return None, "NOT_FOUND"
@@ -972,8 +994,14 @@ def fetch_position_status(symbol):
                 contracts = abs(float(pos.get('contracts', 0) or 0))
             except Exception:
                 contracts = 0.0
-            if contracts > 0 and (pos_sym == wanted or normalize_symbol(pos_sym) == wanted):
-                return pos, "OK"
+            if contracts <= 0:
+                continue
+            if pos_sym != wanted and normalize_symbol(pos_sym) != wanted:
+                continue
+            if position_side is not None:
+                if _leg_of_position(pos) != position_side:
+                    continue
+            return pos, "OK"
         return None, "NOT_FOUND"
     except Exception as e:
         status = SYMBOL_GUARD.record_error(symbol, e)
@@ -3785,6 +3813,248 @@ def close_partial(ratio, stage="PARTIAL"):
         _closing_in_progress = False
         _reconciliation_pending = False
 
+# ---------- Verified close lifecycle (BingX 101205 hardening) ----------
+# ALREADY_CLOSED_ON_EXCHANGE is the explicit terminal outcome for a close
+# target that positively no longer exists on the venue: local state is synced,
+# bookkeeping is finalised, and NO further close order is emitted. It is never
+# a success path for a position that is still open.
+ALREADY_CLOSED_ON_EXCHANGE = "ALREADY_CLOSED_ON_EXCHANGE"
+
+_CLOSE_IN_FLIGHT_LOCK = threading.RLock()
+_CLOSE_IN_FLIGHT = set()
+
+
+def _other_leg(leg):
+    return "SHORT" if str(leg).upper() == "LONG" else "LONG"
+
+
+def _is_no_position_error(exc):
+    """BingX 101205 ("No position to close") means the requested hedge leg no
+    longer exists on the venue. Detection is string-based so it stays decoupled
+    from ccxt import dependencies in unit seams."""
+    text = str(exc or "")
+    return ("101205" in text) or ("no position to close" in text.lower())
+
+
+def _log_close_outcome(symbol, leg, event, reason):
+    try:
+        MEMORY.setdefault("close_log", []).append({
+            "ts": time.time(), "symbol": str(symbol or ""), "leg": str(leg or ""),
+            "event": str(event or ""), "reason": str(reason or ""),
+        })
+        MEMORY["close_log"] = MEMORY["close_log"][-200:]
+    except Exception:
+        pass
+
+
+def _leg_exists(symbol, leg):
+    pos, status = fetch_position_status(symbol, position_side=leg)
+    if status != "OK" or pos is None:
+        return False
+    try:
+        return float(pos.get("contracts", 0) or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _verify_close_target(symbol, position_side):
+    """Close Decision -> Exchange Position Verify.
+
+    Returns a dict describing the CURRENT venue truth for the requested hedge
+    leg. This is the only source the close order determination may use.
+    """
+    out = {
+        "exists": False,
+        "status": "NOT_FOUND",
+        "pos": None,
+        "actual_side": None,
+        "actual_qty": 0.0,
+        "opposite_exists": False,
+    }
+    pos, status = fetch_position_status(symbol, position_side=position_side)
+    if status in ("PAUSED", "ERROR"):
+        out["status"] = status
+        return out
+    if pos is None:
+        # NOT_FOUND for this leg. Report whether the OPPOSITE hedge leg still
+        # exists so the caller never mistakes a sibling-leg position for the
+        # one it is trying to close (and never closes the wrong leg).
+        out["opposite_exists"] = _leg_exists(symbol, _other_leg(position_side))
+        return out
+    try:
+        qty = abs(float(pos.get("contracts", 0) or 0))
+    except (TypeError, ValueError):
+        qty = 0.0
+    out["exists"] = True
+    out["status"] = "OK"
+    out["pos"] = pos
+    out["actual_qty"] = qty
+    out["actual_side"] = _leg_of_position(pos) or position_side
+    return out
+
+
+def _sync_closed_on_exchange(symbol, reason, pos_side, opposite_exists=False, from_error=False, mode="LIVE"):
+    """State Sync for a close target that positively vanished from the venue.
+
+    Order: verify-only (caller already verified) -> State Sync -> bookkeeping.
+    Never emits a close order. Re-asserts the closed flags AFTER finalisation
+    so a hedge reconciliation that re-reads a sibling leg cannot resurrect the
+    closed context.
+    """
+    if not STATE.get("open"):
+        log_execution(f"[CLOSE] {symbol} {pos_side}: already not open locally", "INFO")
+        return True
+    log_execution(
+        f"[CLOSE] {symbol} {pos_side}: {reason}"
+        f"{' (confirmed by re-verify after 101205)' if from_error else ''}"
+        f"{'; opposite hedge leg still open and untouched' if opposite_exists else ''}"
+        " -> local state synced; NO further close order", "WARN")
+    STATE["close_reason"] = reason
+    STATE["last_management_event"] = reason
+    try:
+        _cancel_native_protection(symbol)
+    except Exception as _e:
+        log_execution(f"[CLOSE] protection cancel failed: {_e}", "WARN")
+    _trade_event("CLOSE_EXECUTED", mode=mode, verification=reason,
+                 leg=pos_side, opposite_leg_open=bool(opposite_exists),
+                 from_error=bool(from_error))
+    STATE["open"] = False
+    TRADE_STATE["in_position"] = False
+    DASHBOARD_STATE["live_trade_mode"] = False
+    try:
+        finalize_trade_with_reality(symbol)
+    except Exception as _e:
+        log_execution(f"[CLOSE] finalize after venue-absent sync failed: {_e}", "WARN")
+    # Re-assert after finalisation: sync_position_state() may re-populate a
+    # sibling hedge leg into the shared STATE during the close bookkeeping.
+    DASHBOARD_STATE["live_trade_mode"] = False
+    TRADE_STATE["in_position"] = False
+    STATE["open"] = False
+    STATE["remaining_qty"] = 0.0
+    TRADE_STATE["qty"] = 0.0
+    _log_close_outcome(symbol, pos_side, "CLOSE_EXECUTED", reason)
+    return True
+
+
+def _close_full_live_verified(symbol, sym, pos_side, stage, requested_qty):
+    """Verified full-close transaction (LIVE mode only).
+
+    Sequence: Exchange Position Verify -> Close Order -> Fill Verify ->
+    Position Verify -> State Sync. Every close order is preceded by a fresh
+    leg verify; a leg that vanished is synced as ALREADY_CLOSED_ON_EXCHANGE and
+    never re-ordered. BingX 101205 is re-verified, never blindly swallowed.
+    """
+    req_side = "sell" if pos_side == "LONG" else "buy"
+    attempt = 0
+    while attempt < 3:
+        attempt += 1
+        snap = _verify_close_target(symbol, pos_side)
+        if snap["status"] in ("PAUSED", "ERROR"):
+            _trade_event("CLOSE_STATUS_UNKNOWN", reason=snap["status"])
+            log_execution(f"[CLOSE] Position status UNKNOWN ({snap['status']}); refusing local close", "ERROR")
+            _log_close_outcome(symbol, pos_side, "CLOSE_STATUS_UNKNOWN", snap["status"])
+            return False
+        if not snap["exists"] or snap["actual_qty"] <= 0:
+            return _sync_closed_on_exchange(symbol, ALREADY_CLOSED_ON_EXCHANGE, pos_side,
+                                            opposite_exists=snap["opposite_exists"])
+        actual_qty = snap["actual_qty"]
+        qty_this = min(float(requested_qty), actual_qty)
+        if qty_this <= 0:
+            return _sync_closed_on_exchange(symbol, ALREADY_CLOSED_ON_EXCHANGE, pos_side,
+                                            opposite_exists=snap["opposite_exists"])
+        if qty_this < requested_qty - 1e-12:
+            log_execution(f"[CLOSE] {symbol} {pos_side}: local qty {requested_qty:.6f} > venue qty {actual_qty:.6f}; closing venue qty", "WARN")
+        qty_precise = float(ex.amount_to_precision(sym, qty_this))
+        log_execution(f"[CLOSE] verified {symbol} {pos_side} qty={actual_qty:.6f} -> placing market close (attempt {attempt})", "INFO")
+        try:
+            order = safe_api_call(ex.create_order, sym, "market", req_side, qty_precise, params={"positionSide": pos_side})
+        except Exception as e:
+            if _is_no_position_error(e):
+                # 101205: the requested leg is not on the venue. Re-verify BEFORE
+                # any local decision so a genuinely open position is never
+                # marked closed on error text alone.
+                recheck = _verify_close_target(symbol, pos_side)
+                if not recheck["exists"] or recheck["actual_qty"] <= 0:
+                    return _sync_closed_on_exchange(symbol, ALREADY_CLOSED_ON_EXCHANGE, pos_side,
+                                                    opposite_exists=recheck["opposite_exists"], from_error=True)
+                log_execution(f"[CLOSE] {symbol} {pos_side}: BingX 101205 but re-verify still reports qty={recheck['actual_qty']:.6f}; NOT marking closed", "ERROR")
+                _trade_event("CLOSE_FAILED", reason="101205_RECHECK_POSITION_PRESENT")
+                _log_close_outcome(symbol, pos_side, "CLOSE_FAILED", "101205_RECHECK_POSITION_PRESENT")
+                return False
+            log_execution(f"[CLOSE] order creation failed for {symbol} {pos_side}: {traceback.format_exc()}", "ERROR")
+            _trade_event("CLOSE_FAILED", reason=str(e))
+            _log_close_outcome(symbol, pos_side, "CLOSE_FAILED", "ORDER_CREATION_ERROR")
+            return False
+        if order is None:
+            log_execution(f"[CLOSE] Order creation failed (attempt {attempt})", "ERROR")
+            time.sleep(1)
+            continue
+        order_id = order.get('id')
+        if not order_id:
+            log_execution(f"[CLOSE] No order ID returned (attempt {attempt})", "ERROR")
+            time.sleep(1)
+            continue
+
+        filled, filled_qty = verify_order_filled(symbol, order_id, req_side, qty_precise, timeout=10)
+        if filled:
+            try:
+                _fill_price = float(order.get("average") or order.get("price") or 0.0)
+            except Exception:
+                _fill_price = 0.0
+            if not _fill_price:
+                _fill_price = float(STATE.get("mark_price") or STATE.get("entry") or 0.0)
+            _record_final_close_leg(_fill_price, filled_qty, "LIVE")
+            STATE["profit_execution"] = {
+                "stage": str(stage).upper(), "mode": "LIVE", "requested_qty": float(qty_precise),
+                "filled_qty": float(filled_qty), "fill_price": float(_fill_price), "verified": True,
+                "order_id": str(order_id), "ts": time.time(),
+            }
+            time.sleep(1)
+            snap2 = _verify_close_target(symbol, pos_side)
+            if snap2["status"] in ("PAUSED", "ERROR"):
+                _trade_event("CLOSE_STATUS_UNKNOWN", reason=snap2["status"])
+                log_execution(f"[CLOSE] Position status UNKNOWN ({snap2['status']}); refusing local close", "ERROR")
+                _log_close_outcome(symbol, pos_side, "CLOSE_STATUS_UNKNOWN", snap2["status"])
+                return False
+            if not snap2["exists"] or snap2["actual_qty"] <= 0:
+                log_execution("[CLOSE] Position confirmed closed (no venue qty)", "SUCCESS")
+                try:
+                    _cancel_native_protection(symbol)
+                except Exception as _e:
+                    log_execution(f"[CLOSE] protection cancel failed: {_e}", "WARN")
+                _trade_event("CLOSE_EXECUTED", mode="LIVE", verification="CONFIRMED_ABSENT")
+                STATE["open"] = False
+                TRADE_STATE["in_position"] = False
+                DASHBOARD_STATE["live_trade_mode"] = False
+                try:
+                    finalize_trade_with_reality(symbol)
+                except Exception as _e:
+                    log_execution(f"[CLOSE] finalize failed: {_e}", "WARN")
+                _log_close_outcome(symbol, pos_side, "CLOSE_EXECUTED", "CONFIRMED_ABSENT")
+                return True
+            log_execution(f"[CLOSE] Position still has qty {snap2['actual_qty']:.6f} after close order. Retrying venue qty.", "WARN")
+        else:
+            log_execution(f"[CLOSE] Order did not fill (attempt {attempt})", "ERROR")
+            time.sleep(1)
+            continue
+        continue
+
+    # Attempts exhausted while the venue STILL holds the position: fail closed
+    # with an explicit outcome. Re-verify once; if the leg vanished meanwhile,
+    # sync it as ALREADY_CLOSED_ON_EXCHANGE -- never a blind emergency order.
+    snap = _verify_close_target(symbol, pos_side)
+    if snap["status"] in ("PAUSED", "ERROR"):
+        _trade_event("CLOSE_STATUS_UNKNOWN", reason=snap["status"])
+        _log_close_outcome(symbol, pos_side, "CLOSE_STATUS_UNKNOWN", snap["status"])
+        return False
+    if not snap["exists"] or snap["actual_qty"] <= 0:
+        return _sync_closed_on_exchange(symbol, ALREADY_CLOSED_ON_EXCHANGE, pos_side,
+                                        opposite_exists=snap["opposite_exists"])
+    log_execution(f"[CLOSE] {symbol} {pos_side}: all verified close attempts failed (venue qty {snap['actual_qty']:.6f} still present); refusing blind emergency order", "ERROR")
+    _trade_event("CLOSE_FAILED", reason="ATTEMPTS_EXHAUSTED")
+    _log_close_outcome(symbol, pos_side, "CLOSE_FAILED", "ATTEMPTS_EXHAUSTED")
+    return False
+
 # ========== FIXED: close_position_full with robust verification ==========
 def close_position_full(close_price=None, stage="FULL"):
     global _closing_in_progress, _reconciliation_pending
@@ -3830,99 +4100,36 @@ def close_position_full(close_price=None, stage="FULL"):
             return False
 
         symbol = STATE["current_symbol"]
-        qty_to_close = STATE["remaining_qty"]
+        qty_to_close = float(STATE["remaining_qty"] or 0.0)
         if qty_to_close <= 0:
             log_execution("[CLOSE] No quantity to close", "WARN")
             return False
 
-        side = "sell" if STATE["side"] == "BUY" else "buy"
-        sym = normalize_symbol(symbol)
-        qty_precise = float(ex.amount_to_precision(sym, qty_to_close))
-
-        for attempt in range(3):
-            order = safe_api_call(ex.create_order, sym, "market", side, qty_precise, params={"positionSide": _hedge_position_side(STATE["side"])})
-            if order is None:
-                log_execution(f"[CLOSE] Order creation failed (attempt {attempt+1})", "ERROR")
-                time.sleep(1)
-                continue
-            order_id = order.get('id')
-            if not order_id:
-                log_execution(f"[CLOSE] No order ID returned (attempt {attempt+1})", "ERROR")
-                time.sleep(1)
-                continue
-
-            filled, filled_qty = verify_order_filled(symbol, order_id, side, qty_precise, timeout=10)
-            if filled:
-                try:
-                    _fill_price = float(order.get("average") or order.get("price") or 0.0)
-                except Exception:
-                    _fill_price = 0.0
-                if not _fill_price:
-                    _fill_price = float(STATE.get("mark_price") or STATE.get("entry") or 0.0)
-                _record_final_close_leg(_fill_price, filled_qty, "LIVE")
-                STATE["profit_execution"] = {
-                    "stage": str(stage).upper(), "mode": "LIVE", "requested_qty": float(qty_precise),
-                    "filled_qty": float(filled_qty), "fill_price": float(_fill_price), "verified": True,
-                    "order_id": str(order_id), "ts": time.time(),
-                }
-                time.sleep(1)
-                pos, pos_status = fetch_position_status(symbol)
-                if pos_status == "NOT_FOUND":
-                    log_execution("[CLOSE] Position confirmed closed (no position found)", "SUCCESS")
-                    _cancel_native_protection(symbol)
-                    _trade_event("CLOSE_EXECUTED", mode="LIVE", verification="CONFIRMED_ABSENT")
-                    STATE["open"] = False
-                    TRADE_STATE["in_position"] = False
-                    DASHBOARD_STATE["live_trade_mode"] = False
-                    finalize_trade_with_reality(symbol)
-                    return True
-                elif pos_status == "OK":
-                    current_qty = float(pos.get('contracts', 0))
-                    if current_qty <= 0:
-                        log_execution("[CLOSE] Position confirmed closed (qty=0)", "SUCCESS")
-                        _cancel_native_protection(symbol)
-                        _trade_event("CLOSE_EXECUTED", mode="LIVE", verification="QTY_ZERO")
-                        STATE["open"] = False
-                        TRADE_STATE["in_position"] = False
-                        DASHBOARD_STATE["live_trade_mode"] = False
-                        finalize_trade_with_reality(symbol)
-                        return True
-                    else:
-                        log_execution(f"[CLOSE] Position still has qty {current_qty:.6f} after close order. Retrying...", "WARN")
-                        qty_to_close = current_qty
-                        qty_precise = float(ex.amount_to_precision(sym, qty_to_close))
-                        continue
-                else:
-                    _trade_event("CLOSE_STATUS_UNKNOWN", reason=pos_status)
-                    log_execution(f"[CLOSE] Position status UNKNOWN ({pos_status}); refusing local close", "ERROR")
-                    return False
-            else:
-                log_execution(f"[CLOSE] Order did not fill (attempt {attempt+1})", "ERROR")
-                time.sleep(1)
-                continue
-
-        log_execution("[CLOSE] All close attempts failed. Attempting emergency close via position close.", "ERROR")
         try:
-            order = safe_api_call(ex.create_order, sym, "market", side, qty_precise, params={"positionSide": _hedge_position_side(STATE["side"])})
-            if order:
-                time.sleep(2)
-                pos, pos_status = fetch_position_status(symbol)
-                if pos_status == "NOT_FOUND" or (pos_status == "OK" and float(pos.get('contracts', 0) or 0) <= 0):
-                    _cancel_native_protection(symbol)
-                    _trade_event("CLOSE_EXECUTED", mode="LIVE", verification=pos_status)
-                    STATE["open"] = False
-                    TRADE_STATE["in_position"] = False
-                    DASHBOARD_STATE["live_trade_mode"] = False
-                    finalize_trade_with_reality(symbol)
-                    log_execution("[CLOSE] Emergency close succeeded", "SUCCESS")
-                    return True
-                if pos_status in ("ERROR", "PAUSED"):
-                    _trade_event("CLOSE_STATUS_UNKNOWN", reason=pos_status)
-                    log_execution(f"[CLOSE] Emergency verification UNKNOWN ({pos_status}); local state preserved", "ERROR")
+            pos_side = _hedge_position_side(STATE.get("side"))
+        except ValueError:
+            log_execution(f"[CLOSE] cannot derive hedge positionSide from {STATE.get('side')!r}", "ERROR")
+            _trade_event("CLOSE_FAILED", reason="INVALID_POSITION_SIDE")
+            return False
+
+        sym = normalize_symbol(symbol)
+
+        # Per-(symbol, positionSide) in-flight guard: a second identical close
+        # request must not emit a competing close order while the first is
+        # still being verified/executed.
+        leg_key = (sym, pos_side)
+        try:
+            with _CLOSE_IN_FLIGHT_LOCK:
+                if leg_key in _CLOSE_IN_FLIGHT:
+                    log_execution(f"[CLOSE] {sym} {pos_side} close already in flight; skipping duplicate", "WARN")
+                    _log_close_outcome(symbol, pos_side, "SKIP_DUPLICATE", "ALREADY_IN_FLIGHT")
                     return False
-        except Exception as e:
-            log_execution(f"[CLOSE] Emergency close failed: {e}", "ERROR")
-        return False
+                _CLOSE_IN_FLIGHT.add(leg_key)
+
+            return _close_full_live_verified(symbol, sym, pos_side, stage, qty_to_close)
+        finally:
+            with _CLOSE_IN_FLIGHT_LOCK:
+                _CLOSE_IN_FLIGHT.discard(leg_key)
     except Exception as e:
         log_execution(f"[CLOSE] Error: {traceback.format_exc()}", "ERROR")
         _trade_event("CLOSE_FAILED", reason=str(e))
