@@ -579,6 +579,17 @@ def portfolio_loop(dashboard_module=None):
             if PORTFOLIO.count():
                 PORTFOLIO.manage_all()
 
+            # Account-wide adoption: manual/external positions that appeared on
+            # the venue while the process is running are discovered and managed
+            # through the SAME LiveTradeManager.  This is management coverage
+            # only (never an entry/gate decision), and is throttled to avoid
+            # hammering the exchange API every loop tick.
+            try:
+                PORTFOLIO.adopt_unmanaged_from_exchange(
+                    throttle_sec=float(os.getenv("ADOPTION_SCAN_INTERVAL_SEC", "30") or 30.0))
+            except Exception as exc:
+                log_execution(f"[PORTFOLIO] adoption scan error: {exc}", "WARN")
+
             # Scanner/queue work runs outside any active portfolio context.
             PORTFOLIO.activate(None)
             try:

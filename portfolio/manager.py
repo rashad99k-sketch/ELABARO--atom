@@ -22,6 +22,7 @@ class PositionContext:
     opened_at: float = 0.0
     client_order_id: Optional[str] = None
     asset_class: Optional[str] = None
+    ctx_key: Any = None
 
 
 class PortfolioManager:
@@ -37,6 +38,7 @@ class PortfolioManager:
         self.risk_guard = PortfolioRiskGuard(engine)
         self.trade_registry = TradeRegistry()
         self._last_perf_trade_count = 0
+        self.hedge_mode = False
         if engine is not None:
             self.bind(engine)
 
@@ -53,6 +55,45 @@ class PortfolioManager:
 
     def symbols(self):
         return list(self.contexts.keys())
+
+    def _key_symbol(self, key) -> str:
+        """Underlying exchange symbol of a context key (tuple keys are hedge
+        (symbol, side) pairs; plain keys are symbol strings)."""
+        return key[0] if isinstance(key, tuple) else key
+
+    def _ctx_key(self, symbol: str, side: Optional[str] = None):
+        """Context dict key. In hedge mode the same symbol may hold both a LONG
+        and a SHORT position, so those must be distinct contexts keyed by
+        (symbol, side). Without hedge mode the key stays the plain symbol."""
+        if self.hedge_mode and side in ("BUY", "SELL"):
+            return (symbol, side)
+        return symbol
+
+    def _has_context(self, symbol: str) -> bool:
+        return any(self._key_symbol(k) == symbol for k in self.contexts)
+
+    def _update_hedge_mode(self, positions: List[dict]) -> None:
+        """Detect hedge usage from the venue truth: if the exchange reports both
+        a LONG and a SHORT position for the same symbol, contexts for that
+        account must be keyed by (symbol, side). Detection is per-account and
+        done against the live position list, never guessed."""
+        if self.hedge_mode or not positions:
+            return
+        seen = {}
+        for p in positions or []:
+            sym = str(p.get("symbol") or "")
+            if not sym:
+                continue
+            side = str(p.get("side") or "").upper()
+            if side not in ("BUY", "SELL"):
+                continue
+            seen.setdefault(sym, set()).add(side)
+            if set(("BUY", "SELL")).issubset(seen[sym]):
+                self.hedge_mode = True
+                if self.engine is not None:
+                    self.engine.log_execution(
+                        f"[HEDGE] LONG+SHORT present on {sym}; managing contexts keyed by (symbol, side)", "WARN")
+                return
 
     @staticmethod
     def _asset_class(symbol: str, explicit: str | None = None) -> str:
@@ -119,7 +160,7 @@ class PortfolioManager:
 
     def can_open(self, symbol: str, asset_class: str | None = None) -> bool:
         with self._lock:
-            if symbol in self.contexts or len(self.contexts) >= self.max_positions:
+            if self._has_context(symbol) or len(self.contexts) >= self.max_positions:
                 return False
             if not self.risk_guard.can_open(symbol, len(self.contexts)):
                 return False
@@ -213,10 +254,12 @@ class PortfolioManager:
             self.active_symbol = None
             self._blank()
 
-    def _store_after_open(self, symbol: str, manager, asset_class: Optional[str] = None):
+    def _store_after_open(self, symbol: str, manager, asset_class: Optional[str] = None, key=None):
         if asset_class is None:
             asset_class = self._asset_class(symbol)
-        self.contexts[symbol] = PositionContext(
+        if key is None:
+            key = symbol
+        self.contexts[key] = PositionContext(
             symbol=symbol,
             state=copy.deepcopy(self.engine.STATE),
             trade_state=copy.deepcopy(self.engine.TRADE_STATE),
@@ -226,6 +269,7 @@ class PortfolioManager:
             ) if isinstance(getattr(self.engine, "paper", None), dict) else None,
             opened_at=time.time(),
             asset_class=asset_class,
+            ctx_key=key,
         )
 
     def open_candidate(self, candidate: dict) -> bool:
@@ -360,6 +404,11 @@ class PortfolioManager:
         errors never become a synthetic CLOSED state.  Conservative defaults are
         used for missing historical TP/SL metadata; native/synthetic protection
         is then re-established by the management layer.
+
+        This is management coverage only: adoption deliberately bypasses the
+        entry gate.  A position that positively exists on the venue is managed,
+        regardless of class caps / risk firewall / opening capacity - those
+        limits still gate NEW entries via can_open() on the open_candidate path.
         """
         if not self.engine or self.engine.PAPER_MODE:
             return 0
@@ -368,88 +417,152 @@ class PortfolioManager:
         except Exception as exc:
             self.engine.log_execution(f"[RECOVERY] exchange position enumeration failed: {exc}", "ERROR")
             return 0
+        self._update_hedge_mode(raw or [])
         recovered = 0
         for item in raw or []:
-            symbol = item.get("symbol")
+            symbol = str(item.get("symbol") or "")
             qty = float(item.get("contracts", 0) or 0)
             entry = float(item.get("entryPrice", 0) or 0)
-            side = str(item.get("side", "BUY")).upper()
-            if not symbol or qty <= 0 or entry <= 0 or symbol in self.contexts:
+            if not symbol or qty <= 0 or entry <= 0:
                 continue
-            if not self.can_open(symbol, None):
-                self.engine.log_execution(f"[RECOVERY] {symbol} not adopted: portfolio capacity/cap", "WARN")
+            side = str(item.get("side", "BUY") or "BUY").upper()
+            if self._ctx_key(symbol, side) in self.contexts:
                 continue
-            self.activate(symbol)
+            persisted = None
             try:
-                # Restart recovery must restore the durable trade thesis first.
-                # Recomputing SL/TP from *current* ATR can silently mutate a live
-                # trade after restart and erase TP1/runner/profit-lock history.
-                # Only synthesize conservative levels when no durable record exists.
+                matches = [r for r in self.trade_registry.active() if str(r.symbol) == str(symbol)]
+                if matches:
+                    persisted = max(matches, key=lambda r: float(r.updated_at if hasattr(r, "updated_at") else r.opened_at or 0.0))
+            except Exception:
                 persisted = None
-                try:
-                    matches = [r for r in self.trade_registry.active() if str(r.symbol) == str(symbol)]
-                    if matches:
-                        persisted = max(matches, key=lambda r: float(r.updated_at if hasattr(r, "updated_at") else r.opened_at or 0.0))
-                except Exception:
-                    persisted = None
+            if self._adopt_position(item, persisted):
+                recovered += 1
+        return recovered
 
-                atr = entry * 0.01
-                if persisted is not None and float(persisted.entry or 0) > 0:
-                    sl = float(persisted.sl or 0.0)
-                    tp1 = float(persisted.tp1 or 0.0)
-                    tp2 = float(persisted.tp2 or 0.0)
-                    trade_id = str(persisted.trade_id)
-                    if sl <= 0 or tp1 <= 0 or tp2 <= 0:
-                        # Durable record exists but protection is incomplete: obtain
-                        # venue protection if possible; do not invent from live ATR.
-                        sl = float(item.get("stopLossPrice", 0) or item.get("stopLoss", 0) or 0)
-                        tp1 = float(item.get("takeProfitPrice", 0) or item.get("takeProfit", 0) or 0)
-                        tp2 = 0.0
-                    if sl <= 0 or tp1 <= 0:
-                        self.engine.log_execution(
-                            f"[RECOVERY] {symbol} durable trade {trade_id} missing protection; refusing ATR recompute",
-                            "WARN")
-                else:
+    def adopt_unmanaged_from_exchange(self, throttle_sec: float = 30.0) -> int:
+        """Periodic account-wide adoption inside the live portfolio loop.
+
+        Any position that exists on the venue but is not yet a managed context
+        is adopted into the SAME LiveTradeManager and SAME management path -
+        never a second/parallel execution authority.  Enables manual positions
+        placed while the process is running to be discovered and managed without
+        a restart, and without any entry strategy involvement.
+        """
+        if not self.engine or self.engine.PAPER_MODE:
+            return 0
+        now = time.time()
+        if now - getattr(self, "_last_adopt_scan", 0.0) < throttle_sec:
+            return 0
+        self._last_adopt_scan = now
+        try:
+            raw = self.engine._exchange_sync.fetch_all_open_positions()
+        except Exception as exc:
+            self.engine.log_execution(f"[PORTFOLIO] adoption scan failed: {exc}", "WARN")
+            return 0
+        self._update_hedge_mode(raw or [])
+        adopted = 0
+        for item in raw or []:
+            symbol = str(item.get("symbol") or "")
+            qty = float(item.get("contracts", 0) or 0)
+            if not symbol or qty <= 0:
+                continue
+            side = str(item.get("side", "BUY") or "BUY").upper()
+            if self._ctx_key(symbol, side) in self.contexts:
+                continue
+            if self._adopt_position(item):
+                adopted += 1
+        if adopted:
+            self.engine.log_execution(
+                f"[PORTFOLIO] Adopted {adopted} unmanaged exchange position(s) into managed portfolio", "SUCCESS")
+        return adopted
+
+    def _adopt_position(self, item: dict, persisted=None) -> bool:
+        """Adopt ONE existing exchange position into portfolio management.
+
+        Management coverage, not entry: no class cap / risk firewall / opening
+        capacity decision happens here.  Equivalent exchange truth (contracts,
+        entry, side, symbol) becomes the context; SL/TP fall back to conservative
+        defaults only when neither the venue nor a durable trade record supplies
+        them.  Returns True only when a NEW context was stored.
+        """
+        symbol = str(item.get("symbol") or "")
+        qty = float(item.get("contracts", 0) or 0)
+        entry = float(item.get("entryPrice", 0) or 0)
+        side = str(item.get("side", "BUY") or "BUY").upper()
+        if side not in ("BUY", "SELL"):
+            side = "BUY"
+        if not symbol or qty <= 0 or entry <= 0:
+            return False
+        key = self._ctx_key(symbol, side)
+        if key in self.contexts:
+            return False
+        self.activate(key)
+        try:
+            # Restart recovery must restore the durable trade thesis first.
+            # Recomputing SL/TP from *current* ATR can silently mutate a live
+            # trade after restart and erase TP1/runner/profit-lock history.
+            # Only synthesize conservative levels when no durable record exists.
+            atr = entry * 0.01
+            if persisted is not None and float(persisted.entry or 0) > 0:
+                sl = float(persisted.sl or 0.0)
+                tp1 = float(persisted.tp1 or 0.0)
+                tp2 = float(persisted.tp2 or 0.0)
+                trade_id = str(persisted.trade_id)
+                if sl <= 0 or tp1 <= 0 or tp2 <= 0:
+                    # Durable record exists but protection is incomplete: obtain
+                    # venue protection if possible; do not invent from live ATR.
+                    sl = float(item.get("stopLossPrice", 0) or item.get("stopLoss", 0) or 0)
+                    tp1 = float(item.get("takeProfitPrice", 0) or item.get("takeProfit", 0) or 0)
+                    tp2 = 0.0
+                if sl <= 0 or tp1 <= 0:
+                    self.engine.log_execution(
+                        f"[RECOVERY] {symbol} durable trade {trade_id} missing protection; refusing ATR recompute",
+                        "WARN")
+            else:
+                sl = float(item.get("stopLossPrice", 0) or item.get("stopLoss", 0) or 0)
+                tp1 = float(item.get("takeProfitPrice", 0) or item.get("takeProfit", 0) or 0)
+                tp2 = float(item.get("takeProfit2Price", 0) or 0)
+                if sl <= 0 or tp1 <= 0:
                     sl = entry - atr * 1.6 if side == "BUY" else entry + atr * 1.6
                     tp1 = entry + atr * 1.5 if side == "BUY" else entry - atr * 1.5
                     tp2 = entry + atr * 2.5 if side == "BUY" else entry - atr * 2.5
-                    trade_id = f"REC-{str(symbol).replace('/','_').replace(':','_')}-{int(time.time()*1000)}"
                     self.engine.log_execution(
                         f"[RECOVERY] {symbol} no durable trade record; using conservative fallback protection",
                         "WARN")
-                self.engine.STATE.update({
-                    "open": True, "current_symbol": symbol, "symbol": symbol, "side": side,
-                    "entry": entry, "qty": qty, "remaining_qty": qty, "qty_initial": qty,
-                    "mark_price": float(item.get("markPrice", entry) or entry),
-                    "entry_time": float(getattr(persisted, "opened_at", 0.0) or time.time()) if persisted is not None else time.time(),
-                    "recovered": True, "atr": atr, "entry_atr": atr,
-                    "sl": sl, "dynamic_tp1": tp1, "dynamic_tp2": tp2, "synthetic_sl": sl,
-                    "synthetic_tp1": tp1, "synthetic_tp2": tp2, "tp1_price": tp1, "tp2_price": tp2,
-                    "trade_id": trade_id,
-                    "tp1_hit": bool(getattr(persisted, "tp1_done", False)) if persisted is not None else False,
-                    "runner_enabled": bool(getattr(persisted, "runner", False)) if persisted is not None else False,
-                    "peak_roe": float(getattr(persisted, "peak_roe", 0.0) or 0.0) if persisted is not None else 0.0,
-                    "peak_price": float(getattr(persisted, "peak_price", 0.0) or 0.0) if persisted is not None else 0.0,
-                    "profit_lock_roe": float(getattr(persisted, "profit_lock_roe", 0.0) or 0.0) if persisted is not None else 0.0,
-                    "realized_pnl_usdt": float(getattr(persisted, "realized_pnl", 0.0) or 0.0) if persisted is not None else 0.0,
-                })
-                self.engine.TRADE_STATE.update({"in_position": True, "symbol": symbol, "side": side, "entry": entry, "qty": qty, "last_update_ts": time.time()})
-                self.engine._live_manager.start_trade(symbol, side, entry, qty, sl, tp1, tp2, self.engine.STATE["trade_id"])
-                self._store_after_open(symbol, self.engine._live_manager, None)
-                self.engine.log_execution(f"[RECOVERY] Adopted {symbol} {side} qty={qty:.6f} entry={entry:.6f} trade_id={self.engine.STATE['trade_id']}", "SUCCESS")
-                recovered += 1
-            finally:
-                self.deactivate()
-        return recovered
+                trade_id = f"REC-{str(symbol).replace('/','_').replace(':','_')}-{side}-{int(time.time()*1000)}"
+            self.engine.STATE.update({
+                "open": True, "current_symbol": symbol, "symbol": symbol, "side": side,
+                "entry": entry, "qty": qty, "remaining_qty": qty, "qty_initial": qty,
+                "mark_price": float(item.get("markPrice", entry) or entry),
+                "entry_time": float(getattr(persisted, "opened_at", 0.0) or time.time()) if persisted is not None else time.time(),
+                "recovered": True, "atr": atr, "entry_atr": atr,
+                "sl": sl, "dynamic_tp1": tp1, "dynamic_tp2": tp2, "synthetic_sl": sl,
+                "synthetic_tp1": tp1, "synthetic_tp2": tp2, "tp1_price": tp1, "tp2_price": tp2,
+                "trade_id": trade_id,
+                "tp1_hit": bool(getattr(persisted, "tp1_done", False)) if persisted is not None else False,
+                "runner_enabled": bool(getattr(persisted, "runner", False)) if persisted is not None else False,
+                "peak_roe": float(getattr(persisted, "peak_roe", 0.0) or 0.0) if persisted is not None else 0.0,
+                "peak_price": float(getattr(persisted, "peak_price", 0.0) or 0.0) if persisted is not None else 0.0,
+                "profit_lock_roe": float(getattr(persisted, "profit_lock_roe", 0.0) or 0.0) if persisted is not None else 0.0,
+                "realized_pnl_usdt": float(getattr(persisted, "realized_pnl", 0.0) or 0.0) if persisted is not None else 0.0,
+            })
+            self.engine.TRADE_STATE.update({"in_position": True, "symbol": symbol, "side": side, "entry": entry, "qty": qty, "last_update_ts": time.time()})
+            self.engine._live_manager.start_trade(symbol, side, entry, qty, sl, tp1, tp2, self.engine.STATE["trade_id"])
+            self._store_after_open(symbol, self.engine._live_manager, None, key=key)
+            self.engine.log_execution(f"[RECOVERY] Adopted {symbol} {side} qty={qty:.6f} entry={entry:.6f} trade_id={self.engine.STATE['trade_id']}", "SUCCESS")
+            return True
+        finally:
+            self.deactivate()
 
     def manage_all(self):
         if not self.engine:
             return
-        for symbol in list(self.contexts.keys()):
-            self.activate(symbol)
+        for key in list(self.contexts.keys()):
+            symbol = self._key_symbol(key)
+            self.activate(key)
             try:
                 if not self.engine.STATE.get("open"):
-                    ctx = self.contexts.pop(symbol, None)
+                    ctx = self.contexts.pop(key, None)
                     if ctx is not None and callable(getattr(ctx.live_manager, "dispose", None)):
                         ctx.live_manager.dispose()
                     continue
@@ -463,7 +576,7 @@ class PortfolioManager:
                 # closes. Emergency/SL handling is already enforced inside the
                 # manager's verified execution path.
                 if not self.engine.STATE.get("open"):
-                    ctx = self.contexts.pop(symbol, None)
+                    ctx = self.contexts.pop(key, None)
                     if ctx is not None and callable(getattr(ctx.live_manager, "dispose", None)):
                         ctx.live_manager.dispose()
                 else:
@@ -498,7 +611,7 @@ class PortfolioManager:
             positions = self.engine._exchange_sync.fetch_all_open_positions()
             for pos in positions:
                 symbol = pos.get('symbol')
-                if not symbol or symbol in self.contexts:
+                if not symbol or self._has_context(symbol):
                     continue
                 # Create a new context from the position data
                 self.activate(symbol)
@@ -559,23 +672,30 @@ class PortfolioManager:
         # controls test consume the portfolio risk view through this method.
         return self.risk_guard.snapshot(self.count())
 
-    def close_symbol(self, symbol: str) -> bool:
-        if symbol not in self.contexts:
+    def close_symbol(self, symbol: str, side: Optional[str] = None) -> bool:
+        keys = [k for k in self.contexts if self._key_symbol(k) == symbol]
+        if self.hedge_mode and side in ("BUY", "SELL"):
+            wanted = (symbol, side)
+            keys = [k for k in keys if k == wanted]
+        if not keys:
             return False
-        self.activate(symbol)
-        try:
-            if self.engine.STATE.get("open"):
-                self.engine.close_position_full()
-            closed = not self.engine.STATE.get("open")
-            if closed:
-                ctx = self.contexts.pop(symbol, None)
-                if ctx is not None and callable(getattr(ctx.live_manager, "dispose", None)):
-                    ctx.live_manager.dispose()
-            else:
-                self._capture()
-            return closed
-        finally:
-            self.deactivate()
+        closed = False
+        for key in keys:
+            self.activate(key)
+            try:
+                if self.engine.STATE.get("open"):
+                    self.engine.close_position_full()
+                done = not self.engine.STATE.get("open")
+                if done:
+                    ctx = self.contexts.pop(key, None)
+                    if ctx is not None and callable(getattr(ctx.live_manager, "dispose", None)):
+                        ctx.live_manager.dispose()
+                else:
+                    self._capture()
+                closed = closed or done
+            finally:
+                self.deactivate()
+        return closed
 
     def shutdown(self) -> None:
         """Detach all per-position managers from the shared engine event bus.
@@ -598,8 +718,9 @@ class PortfolioManager:
 
     def snapshot(self):
         out = []
-        for symbol in list(self.contexts.keys()):
-            ctx = self.contexts[symbol]
+        for key in list(self.contexts.keys()):
+            ctx = self.contexts[key]
+            symbol = self._key_symbol(key)
             payload = canonical_position_payload(symbol, ctx.state, self._ctx_class(ctx))
             out.append(payload)
         return out
