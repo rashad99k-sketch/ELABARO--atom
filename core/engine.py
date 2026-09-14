@@ -3694,7 +3694,13 @@ def _native_protection_gate_ok(symbol, side, score, adx_val):
     _hydrate_native_protection()
     if _NATIVE_PROTECTION is None or not getattr(_NATIVE_PROTECTION, "enabled", False):
         global _protection_required_warned
-        log_execution(f"[LIVE_SAFETY] {symbol} blocked: exchange-native protection is required for LIVE entries", "ERROR")
+        _np_exists = _NATIVE_PROTECTION is not None
+        _np_enabled = getattr(_NATIVE_PROTECTION, "enabled", False) if _np_exists else False
+        _env_val = os.getenv("ENABLE_NATIVE_PROTECTION", "<unset>").strip().strip('"').strip("'")
+        log_execution(
+            f"[LIVE_SAFETY] {symbol} blocked: exchange-native protection is required for LIVE entries"
+            f" (manager={'exists' if _np_exists else 'MISSING'}, enabled={_np_enabled},"
+            f" ENABLE_NATIVE_PROTECTION='{_env_val}')", "ERROR")
         if not _protection_required_warned:
             _protection_required_warned = True
             log_execution(f"[LIVE_SAFETY] {symbol}: set ENABLE_NATIVE_PROTECTION=1 (plus NATIVE_PROTECTION_ORDER_TYPE/NATIVE_PROTECTION_PARAMS_JSON as needed) to require the native SL, or REQUIRE_NATIVE_PROTECTION_LIVE=0 to allow the synthetic/paper SL manager", "WARN")
@@ -8553,6 +8559,27 @@ def _build_entry_setup_snapshot(symbol, side, df, price, atr, context=None):
         "hunter": copy.deepcopy(context.get("pro_hunter", {})) if isinstance(context.get("pro_hunter"), dict) else {},
     }
 
+def _ready_execution_grace(context):
+    """READY-execution grace decision.
+
+    A candidate that the queue granted READY within the grace window
+    (``is_ready_validated`` + a fresh ``ready_ts`` anchored at the queue's READY
+    grant) may see a few seconds of ADX/liquidity drift between the READY
+    evaluation frame and the live order frame. Returns ``(grace_ok, grace_sec)``
+    where ``grace_ok`` is True only for a LIVE, freshly-validated READY grant;
+    absent validation, stale grants and non-READY fallback candidates hard-block.
+    """
+    _exec_ctx = (context or {}).get("execution_context") or {}
+    _grace_sec = max(0.0, float(os.getenv("EXECUTION_READY_GRACE_SEC", "90")))
+    _anchored_ts = float(_exec_ctx.get("ready_ts", 0) or 0)
+    _grace_ok = bool(
+        _exec_ctx.get("is_ready_validated")
+        and _anchored_ts > 0
+        and (time.time() - _anchored_ts) <= _grace_sec
+    )
+    return _grace_ok, _grace_sec
+
+
 def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, trade_type, entry_type, classification, context=None):
     """Final execution gate. Strategy intelligence decides *whether* the setup
     is institutionally mature; this function remains the sole order-entry
@@ -8633,18 +8660,36 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             log_execution(
                 f"[SESSION] context error for {symbol}: {_session_err}", "WARN",
                 debounce_key=f"session_ctx_{symbol}", debounce_sec=300)
+    # READY-execution grace (bounded). A candidate that the queue granted READY
+    # within the grace window (is_ready_validated + fresh ready_ts anchored at
+    # the queue's READY grant) may see a few seconds of ADX/liquidity drift
+    # between the READY evaluation frame and the live order frame. We tolerate
+    # ONLY a bounded ADX slide around the validated value inside the same band;
+    # genuine regime flips, absent READY validation, or stale grants remain
+    # hard-blocked. Liquidity-direction transitions are only acceptable when the
+    # READY grant itself is fresh; never for non-READY/fallback candidates.
+    _ready_grace_ok, _ready_grace_sec = _ready_execution_grace(context)
+    _exec_ctx = (context or {}).get("execution_context") or {}
+    _ready_adx_val = float(_exec_ctx.get("ready_adx", 0) or 0)
+    _ready_adx_tol = float(os.getenv("EXECUTION_READY_ADX_TOLERANCE", "8.0"))
     try:
         adx_series = compute_adx(df)
         adx_val = float(adx_series.iloc[-1]) if adx_series is not None and len(adx_series) else 0.0
     except Exception:
         adx_val = 0.0
     if not (float(cfg["min_adx"]) <= adx_val <= float(cfg["max_adx"])):
-        log_execution(f"[ENTRY] {asset_class} ADX {adx_val:.1f} outside [{cfg['min_adx']},{cfg['max_adx']}]", "WARN")
-        _record_exec_blocker(symbol, "ADX_REJECT",
-                             f"ADX {adx_val:.1f} outside [{cfg['min_adx']},{cfg['max_adx']}]",
-                             side, score, adx=adx_val,
-                             required_adx=[float(cfg['min_adx']), float(cfg['max_adx'])])
-        return False
+        if _ready_grace_ok and _ready_adx_val > 0 and abs(adx_val - _ready_adx_val) <= _ready_adx_tol:
+            log_execution(
+                f"[ENTRY] {asset_class} ADX {adx_val:.1f} drifted from READY {_ready_adx_val:.1f} "
+                f"within grace ({_ready_grace_sec:.0f}s) - accepted", "WARN",
+                debounce_key=f"adx_grace_{symbol}", debounce_sec=60)
+        else:
+            log_execution(f"[ENTRY] {asset_class} ADX {adx_val:.1f} outside [{cfg['min_adx']},{cfg['max_adx']}]", "WARN")
+            _record_exec_blocker(symbol, "ADX_REJECT",
+                                 f"ADX {adx_val:.1f} outside [{cfg['min_adx']},{cfg['max_adx']}]",
+                                 side, score, adx=adx_val,
+                                 required_adx=[float(cfg['min_adx']), float(cfg['max_adx'])])
+            return False
 
     # Execution-layer safety gate.
     # IMPORTANT ARCHITECTURAL CONTRACT:
@@ -8665,14 +8710,24 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             liquidity_ctx = None
         expected_ctx = "sell_side_taken" if side == "BUY" else "buy_side_taken"
         if liquidity_ctx != expected_ctx:
-            log_execution(
-                f"[ENTRY] {side} requires {expected_ctx}, got {liquidity_ctx} – execution blocked",
-                "WARN",
-            )
-            _record_exec_blocker(symbol, "LIQUIDITY_REJECT",
-                                 f"{side} requires {expected_ctx}, got {liquidity_ctx}",
-                                 side, score, adx=adx_val)
-            return False
+            if _ready_grace_ok:
+                # SAME READY-validation contract as the ADX grace: the immediate
+                # post-READY frame may flip the live liquidity context label
+                # seconds after the READY grant while the underlying directional
+                # sweep evidence is unchanged; the queue already validated it.
+                log_execution(
+                    f"[ENTRY] {side} liquidity {liquidity_ctx} != {expected_ctx} but READY "
+                    f"validated within grace ({_ready_grace_sec:.0f}s) - accepted", "WARN",
+                    debounce_key=f"liq_grace_{symbol}", debounce_sec=60)
+            else:
+                log_execution(
+                    f"[ENTRY] {side} requires {expected_ctx}, got {liquidity_ctx} – execution blocked",
+                    "WARN",
+                )
+                _record_exec_blocker(symbol, "LIQUIDITY_REJECT",
+                                     f"{side} requires {expected_ctx}, got {liquidity_ctx}",
+                                     side, score, adx=adx_val)
+                return False
         if SWEEP_AUTHENTICITY:
             try:
                 sweep_grad, sweep_bar = get_sweep_authenticity(df, side, lookback=int(cfg.get("sweep_bars", 10)))
@@ -16571,16 +16626,18 @@ class ExecutionQueue:
             log_execution(f"[QUEUE] {symbol} returned to Watchlist: {reason}", "WARN")
 
     def cleanup(self):
+        queue_lifetime_sec = max(
+            300.0, float(os.getenv("QUEUE_LIFETIME_SEC", "7200")))
         with self._lock:
             now = time.time()
             to_remove = []
             for symbol, cand in self._candidates.items():
                 if cand.state in (ExecutionState.EXECUTED, ExecutionState.INVALIDATED, ExecutionState.RETURNED_WATCHLIST):
                     to_remove.append(symbol)
-                elif now - cand.added_at > 3600:
+                elif now - cand.added_at > queue_lifetime_sec:
                     self.gate_stats["expired"] += 1
                     record_gate_event(symbol, "QUEUE", "EXPIRED",
-                                      f"older than 1h, score={cand.priority_score:.1f}", cand.side)
+                                      f"older than {queue_lifetime_sec/3600:.1f}h, score={cand.priority_score:.1f}", cand.side)
                     if cand.priority_score >= 40:
                         self._return_to_watchlist(symbol, "Expired")
                     to_remove.append(symbol)

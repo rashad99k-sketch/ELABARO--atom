@@ -80,5 +80,67 @@ class PortfolioRiskGuardTest(unittest.TestCase):
         self.assertEqual(status.reason, "OK")
 
 
+class PaperEquityIgnoresStaleBalanceCacheTest(unittest.TestCase):
+    """Regression: risk._equity() must read the paper ledger directly, never the
+    cached get_balance_safe() value. A stale 10s balance cache combined with a
+    moving free balance produced wild drawdown readings (42% on a flat book),
+    spuriously blocking can_open after every position was closed."""
+
+    class PaperEngine:
+        PAPER_MODE = True
+        PERF = {"trades": 0, "last_trade": None}
+
+        def __init__(self):
+            self.paper = {"balance": 10000.0, "committed_margin": 0.0}
+            self._cached = 5763.0  # adversarial stale cache (old low reading)
+
+        def get_balance_safe(self):
+            return self._cached
+
+    def setUp(self):
+        self._env = dict(os.environ)
+        os.environ["POSITION_MARGIN_PCT"] = "0.10"
+        os.environ["PORTFOLIO_MARGIN_CAP_PCT"] = "0.60"
+        os.environ["MAX_DAILY_LOSS_PCT"] = "20"
+        os.environ["MAX_CONSECUTIVE_LOSSES"] = "3"
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self._env)
+
+    def _after_full_cycle(self, balance, committed):
+        e = self.PaperEngine()
+        e.paper = {"balance": balance, "committed_margin": committed}
+        guard = PortfolioRiskGuard(e)
+        guard.status(current_positions=0)
+        return guard, e
+
+    def test_stale_cached_balance_never_distorts_paper_equity(self):
+        # Real paper books after opening six positions then closing them all:
+        # free + committed reconcile to ~start + realized PnL (9658.35). The
+        # stale cache claim of 5763 must be ignored entirely in PAPER_MODE.
+        guard, e = self._after_full_cycle(9658.35, 0.0)
+        self.assertEqual(guard._equity(), 9658.35)
+        status = guard.status(current_positions=0)
+        self.assertTrue(status.allowed)
+        self.assertEqual(status.reason, "OK")
+
+    def test_committed_cash_still_counts_in_paper_equity(self):
+        guard, e = self._after_full_cycle(9200.0, 700.0)
+        self.assertEqual(guard._equity(), 9900.0)
+
+    def test_live_path_keeps_cached_balance_behavior(self):
+        # Without PAPER_MODE the guard still reads get_balance_safe() so live
+        # exchange calls stay cached (rate-safety unchanged) -- plus committed.
+        class LiveEngine(PaperEquityIgnoresStaleBalanceCacheTest.PaperEngine):
+            PAPER_MODE = False
+
+        e = LiveEngine()
+        e.paper["committed_margin"] = 0.0
+        guard = PortfolioRiskGuard(e)
+        guard.status(current_positions=0)
+        self.assertEqual(guard._equity(), e._cached)
+
+
 if __name__ == "__main__":
     unittest.main()

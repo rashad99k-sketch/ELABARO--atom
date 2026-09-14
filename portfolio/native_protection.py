@@ -12,8 +12,9 @@ class NativeProtectionManager:
     def __init__(self, exchange=None, logger=None):
         self.exchange=exchange
         self.logger=logger or (lambda *a,**k:None)
-        self.enabled=os.getenv("ENABLE_NATIVE_PROTECTION","0").lower() in {"1","true","yes","on"}
-        self.order_type=os.getenv("NATIVE_PROTECTION_ORDER_TYPE","STOP_MARKET")
+        _raw = os.getenv("ENABLE_NATIVE_PROTECTION","0").strip().strip('"').strip("'")
+        self.enabled=_raw.lower() in {"1","true","yes","on"}
+        self.order_type=os.getenv("NATIVE_PROTECTION_ORDER_TYPE","STOP_MARKET").strip().strip('"').strip("'")
         self._orders={}
     def status(self,symbol):
         o=self._orders.get(symbol)

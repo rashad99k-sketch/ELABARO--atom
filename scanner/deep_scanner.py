@@ -1095,6 +1095,25 @@ class DeepScanner:
             _strong_ready = (score >= 8.0 and _win_check.get("grade") in {"A", "A+"}
                              and bool(_win_check.get("vpa_confirmed"))
                              and not bool(_win_check.get("vpa_adverse")))
+            # ---- RORO / institutional flow signal (directional win-side) -----
+            # Feeds the A-GRADE fast path (engine._update_a_grade_status ->
+            # a_grade_ready) and the RO_RO_INSTITUTIONAL_FLOW precursor. It is
+            # DERIVED from the same causal win-side OB/VPA/struct/liquidity
+            # evidence the queue re-validates (never hardcoded), so a genuine
+            # institutional setup can enter the queue fast while the live
+            # trigger / confirmation / ATOM / ADX gates stay authoritative.
+            _roro_signal = bool(
+                _win_check.get("grade") in {"A", "A+"}
+                and float(_win_check.get("structure_score", 0) or 0) >= 70
+                and float(_win_check.get("liquidity_score", 0) or 0) >= 60
+                and bool(_win_check.get("vpa_confirmed", False))
+                and not bool(_win_check.get("vpa_adverse", False))
+                and not bool(institutional_analysis.get("opposing_ob_conflict", False))
+            )
+            _roro_reason = (
+                "WIN_SIDE_CAUSAL_OB+VPA+STRUCT+LIQ" if _roro_signal
+                else "missing OB/VPA/STRUCT/LIQ/conflict"
+            )
             # A raw 8+ score without institutional/VPA confirmation is deliberately
             # held in MEDIUM-equivalent preparation; this prevents a misleading
             # STRONG badge while preserving the old public strength vocabulary.
@@ -1112,7 +1131,8 @@ class DeepScanner:
                 "ob_grade": _win_ob.get("grade", "INVALID"),
                 "liq_score": float(_win_ob.get("liquidity_score", 0) or 0),
                 "struct_score": float(_win_ob.get("structure_score", 0) or 0),
-                "roro_signal": False,
+                "roro_signal": _roro_signal,
+                "roro_reason": _roro_reason,
                 "strong_ob": _win_ob.get("grade") in {"A", "A+"},
                 "composite_score": round(float(score), 3),
                 "trap_risk": float((best.get("trade_intelligence") or {}).get("trap_risk", 0) or 0),

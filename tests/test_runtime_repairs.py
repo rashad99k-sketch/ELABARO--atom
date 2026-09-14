@@ -269,6 +269,20 @@ class NewsEntityMatchingTest(unittest.TestCase):
         import news.service as N
         cls.N = N
 
+    def setUp(self):
+        # Module-level os.environ.setdefault(NEWS_ENABLED, ...) in sibling test
+        # files runs in import order and can leave NEWS_ENABLED=False by the
+        # time this module is imported. Pin the flag per-test so these entity
+        # matching tests are deterministic regardless of collection order.
+        self._news_env_prev = os.environ.get("NEWS_ENABLED")
+        os.environ["NEWS_ENABLED"] = "True"
+
+    def tearDown(self):
+        if self._news_env_prev is None:
+            os.environ.pop("NEWS_ENABLED", None)
+        else:
+            os.environ["NEWS_ENABLED"] = self._news_env_prev
+
     def test_direct_headline_matches_symbol_aliases(self):
         N = self.N
         aliases = N.NewsService._entity_aliases("BTC/USDT:USDT", "CRYPTO")

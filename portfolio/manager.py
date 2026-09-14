@@ -321,6 +321,7 @@ class PortfolioManager:
                 "zone_high": float(candidate.get("zone_high", 0.0) or 0.0),
                 "ob_grade": candidate.get("ob_grade", "NONE"),
                 "vpa": candidate.get("vpa", (candidate.get("evidence", {}) or {}).get("vpa", {})),
+                "execution_context": candidate.get("execution_context") or {},
                 "news": candidate.get("news", {}),
                 "news_reaction": candidate.get("news_reaction", {}),
                 "reason": candidate.get("reason", []),

@@ -436,6 +436,11 @@ def _execute_ready_queue_candidate():
             "move_maturity": watch.get("move_maturity", getattr(best, "move_maturity", "UNKNOWN")) if isinstance(watch, dict) else getattr(best, "move_maturity", "UNKNOWN"),
             "early_formation": watch.get("early_formation", {}) if isinstance(watch, dict) else {},
             "zone": watch.get("zone") if isinstance(watch, dict) else None,
+            "execution_context": {
+                "is_ready_validated": is_ready,
+                "ready_ts": float(getattr(best, "ready_time", 0) or 0),
+                "ready_adx": float(getattr(best, "latest_adx", 0) or 0),
+            },
         }
 
         # Global portfolio-allocator gate: rejects when class/direction caps

@@ -1168,7 +1168,7 @@ def promote_to_queue():
         side = str(entry.get("side", "BUY")).upper()
         qcfg = queue._resolve_ob_cfg(sym)
 
-        max_ext_atr = float(os.getenv("QUEUE_MAX_EXTENSION_ATR", "1.5"))
+        max_ext_atr = float(os.getenv("QUEUE_MAX_EXTENSION_ATR", "2.5"))
         zl_c, zh_c, _zb_c, _zt_c = queue._find_causal_ob_zone(df, side, atr, qcfg)
         if zl_c and zh_c:
             dist_atr = abs(price - (zl_c + zh_c) / 2.0) / atr

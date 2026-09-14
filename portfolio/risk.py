@@ -46,13 +46,16 @@ class PortfolioRiskGuard:
         )
 
     def _equity(self) -> float:
+        paper = getattr(self.engine, "paper", None)
+        if isinstance(paper, dict) and getattr(self.engine, "PAPER_MODE", False):
+            return (max(0.0, float(paper.get("balance", 0.0) or 0.0))
+                    + max(0.0, float(paper.get("committed_margin", 0.0) or 0.0)))
         try:
             if self.engine is not None:
                 bal = max(0.0, float(self.engine.get_balance_safe()))
                 # Committed margin is part of total equity, NOT a loss. Account
                 # for it so that opening positions (which moves free balance
                 # into committed margin) does not register as a daily drawdown.
-                paper = getattr(self.engine, "paper", None)
                 if isinstance(paper, dict):
                     bal += max(0.0, float(paper.get("committed_margin", 0.0)))
                 return bal
