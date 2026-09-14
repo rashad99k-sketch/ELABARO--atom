@@ -3673,6 +3673,35 @@ def _ensure_native_protection(symbol):
     )
     return _set_protection_status(result.get("status", "UNPROTECTED"), result.get("sl_order_id"), result.get("reason"))
 
+_protection_required_warned = False
+
+def _hydrate_native_protection():
+    """Hydrate the protection manager WITHOUT placing any order.
+
+    The LIVE gate must not self-block a correctly-configured first entry
+    simply because the manager is still None; actual SL placement stays
+    post-fill (start_trade -> _ensure_native_protection). Fail-closed
+    behaviour is unchanged when the mechanism is not configured."""
+    global _NATIVE_PROTECTION
+    if _NATIVE_PROTECTION is None and NativeProtectionManager is not None:
+        if os.getenv("ENABLE_NATIVE_PROTECTION", "0").strip().lower() in {"1", "true", "yes", "on"}:
+            _NATIVE_PROTECTION = NativeProtectionManager(ex, log_execution)
+
+def _native_protection_gate_ok(symbol, side, score, adx_val):
+    """Fail-closed gate: live entries require exchange-native SL protection."""
+    if not (MODE_LIVE and REQUIRE_NATIVE_PROTECTION_LIVE):
+        return True
+    _hydrate_native_protection()
+    if _NATIVE_PROTECTION is None or not getattr(_NATIVE_PROTECTION, "enabled", False):
+        global _protection_required_warned
+        log_execution(f"[LIVE_SAFETY] {symbol} blocked: exchange-native protection is required for LIVE entries", "ERROR")
+        if not _protection_required_warned:
+            _protection_required_warned = True
+            log_execution(f"[LIVE_SAFETY] {symbol}: set ENABLE_NATIVE_PROTECTION=1 (plus NATIVE_PROTECTION_ORDER_TYPE/NATIVE_PROTECTION_PARAMS_JSON as needed) to require the native SL, or REQUIRE_NATIVE_PROTECTION_LIVE=0 to allow the synthetic/paper SL manager", "WARN")
+        _record_exec_blocker(symbol, "PROTECTION_REQUIRED", "ENABLE_NATIVE_PROTECTION must be enabled for live entries", side, score, adx=adx_val)
+        return False
+    return True
+
 def _cancel_native_protection(symbol):
     if _NATIVE_PROTECTION is None:
         return True
@@ -8966,11 +8995,8 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         log_execution(f"[EXECUTION] {symbol} {side} executed (paper) at {price:.4f}", "SUCCESS")
         return True
 
-    if MODE_LIVE and REQUIRE_NATIVE_PROTECTION_LIVE:
-        if _NATIVE_PROTECTION is None or not getattr(_NATIVE_PROTECTION, "enabled", False):
-            log_execution(f"[LIVE_SAFETY] {symbol} blocked: exchange-native protection is required for LIVE entries", "ERROR")
-            _record_exec_blocker(symbol, "PROTECTION_REQUIRED", "ENABLE_NATIVE_PROTECTION must be enabled for live entries", side, score, adx=adx_val)
-            return False
+    if not _native_protection_gate_ok(symbol, side, score, adx_val):
+        return False
 
     sym = normalize_symbol(symbol)
     market = ex.market(sym)
