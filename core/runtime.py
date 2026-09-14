@@ -309,6 +309,29 @@ def _service_watchlist_and_queue():
     except Exception as exc:
         log_execution(f"[PORTFOLIO] allocation evaluation failed: {exc}", "WARN")
 
+def _class_ready_score_floor(candidate):
+    """SINGLE SOURCE OF TRUTH for the READY/EXECUTION score floor.
+
+    Returns the exact floor the readiness authority used to grant READY:
+    AssetBehaviorProfile.entry_config().ready_score (engine.py:16121 /
+    2780-2787), preferring the per-candidate value stored by the engine at
+    readiness time. There is deliberately NO independent global floor here: a
+    READY candidate (ready_blocker == NONE) must not be rejected by a second,
+    duplicated threshold.
+    """
+    req = getattr(candidate, "ready_score_required", None)
+    if req is not None:
+        try:
+            return float(req)
+        except Exception:
+            pass
+    try:
+        _cls = E.AssetBehaviorProfile.resolve_asset_class(candidate.symbol)
+        return float(E.AssetBehaviorProfile.entry_config(_cls).get("ready_score", 75))
+    except Exception:
+        return 75.0
+
+
 def _execute_ready_queue_candidate():
     """Execute only a READY queue candidate through PortfolioManager.
 
@@ -347,19 +370,34 @@ def _execute_ready_queue_candidate():
 
     try:
         best = queue.get_best_candidate()
-        # Unified with zone_score threshold: READY and EXECUTION both at 75.
-        # A genuinely READY candidate keeps the strict ready floor. A candidate
+        # SINGLE SOURCE OF TRUTH for the READY/EXECUTION score floor.
+        # READY is granted by the class-aware readiness authority
+        # (AssetBehaviorProfile.entry_config().ready_score, engine.py:16121 /
+        # 2780-2787). The execution path re-checks ONLY that same floor, so a
+        # candidate that is genuinely READY (ready_blocker == NONE) is never
+        # killed by a second, duplicated threshold (the legacy global
+        # QUEUE_MIN_READY_SCORE=75 was exactly that duplicate). A candidate
         # offered through the confirmed-trigger fallback (Waiting) is NOT
-        # hard-blocked by this floor: the authoritative final decision is the
-        # Entry Quality / quality assessment inside PORTFOLIO.open_candidate /
-        # execute_entry.
+        # hard-blocked by any score floor: the authoritative final decision is
+        # the Entry Quality / quality assessment inside
+        # PORTFOLIO.open_candidate -> execute_entry. All other execution gates
+        # (kill switch, slots, news, allocator, portfolio, execute_entry,
+        # Zone/OB Judge, sizing, exchange validation) are unchanged below.
         is_ready = best is not None and best.state == ExecutionState.READY
         if best is None:
             _exec_gate("no_ready_candidate")
             return False
-        if is_ready and best.priority_score < float(os.getenv("QUEUE_MIN_READY_SCORE", "75")):
-            _exec_gate("ready_score_below_min")
-            return False
+        if is_ready:
+            ready_floor = _class_ready_score_floor(best)
+            if best.priority_score + 1e-9 < ready_floor:
+                _exec_gate("ready_score_below_min")
+                E.record_gate_event(
+                    best.symbol, "EXECUTION", "READY_REJECTED",
+                    f"score={best.priority_score:.2f} required={ready_floor:.1f} "
+                    f"candidate_id={getattr(best, 'candidate_id', '') or getattr(best, 'trade_id', '')} "
+                    f"gate=READY_FLOOR reason=below class ready score",
+                    best.side)
+                return False
 
         # News is contextual evidence/catalyst and execution-risk input; it must
         # not independently qualify or create an entry. Technical and
