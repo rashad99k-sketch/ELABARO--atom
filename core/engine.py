@@ -688,6 +688,7 @@ def set_leverage(symbol, leverage):
 _live_high = {}
 _live_low = {}
 _last_candle_timestamp = {}
+_last_candle_base = {}
 
 def get_live_hybrid_df(symbol, base_df: pd.DataFrame, live_price: float) -> pd.DataFrame:
     if base_df is None or base_df.empty or live_price is None or live_price <= 0:
@@ -698,10 +699,15 @@ def get_live_hybrid_df(symbol, base_df: pd.DataFrame, live_price: float) -> pd.D
         current_ts = df.loc[last_idx, 'timestamp']
     else:
         current_ts = last_idx
-    global _last_candle_timestamp, _live_high, _live_low
+    global _last_candle_timestamp, _last_candle_base, _live_high, _live_low
+    base_row = (float(df.loc[last_idx, 'open']), float(df.loc[last_idx, 'high']),
+                float(df.loc[last_idx, 'low']))
     prev_ts = _last_candle_timestamp.get(symbol)
-    if prev_ts is None or current_ts != prev_ts:
+    prev_base = _last_candle_base.get(symbol)
+    same_candle = prev_ts is not None and current_ts == prev_ts and prev_base == base_row
+    if not same_candle:
         _last_candle_timestamp[symbol] = current_ts
+        _last_candle_base[symbol] = base_row
         _live_high[symbol] = df.loc[last_idx, 'high']
         _live_low[symbol] = df.loc[last_idx, 'low']
     else:
@@ -864,6 +870,27 @@ def get_ticker_safe(symbol):
         if price and price > 0:
             cache_set("ticker", price, symbol)
             return price
+    return None
+
+def _fresh_execution_mark(symbol):
+    """Authoritative execution price for a live position tick.
+
+    Prefer a fresh ticker (get_ticker_safe has its own 2s cache, so this is
+    cheap); fall back to the last known STATE["mark_price"]. Never return a
+    stale or zero price masked as current. The previous pattern read the
+    cached mark directly and refreshed it only via reconcile every >=10s,
+    which let TP1/TP2/SL/trailing decisions run on stale marks and miss brief
+    touches between samples.
+    """
+    try:
+        fresh = get_ticker_safe(symbol)
+    except Exception:
+        fresh = None
+    if fresh and float(fresh) > 0:
+        return float(fresh)
+    cached = STATE.get("mark_price")
+    if cached and float(cached) > 0:
+        return float(cached)
     return None
 
 def get_balance_safe():
@@ -4900,9 +4927,12 @@ class LiveTradeManager:
         df_closed = get_ohlcv_safe(symbol, 50)
         if df_closed is None:
             return
-        mark_price = STATE.get("mark_price", get_ticker_safe(symbol))
-        if not mark_price:
+        # Fresh authoritative execution price every tick, then persist it so
+        # SL/trailing/profit gates all decide on the same live number.
+        mark_price = _fresh_execution_mark(symbol)
+        if mark_price is None:
             return
+        STATE["mark_price"] = mark_price
 
         df_live = get_live_hybrid_df(symbol, df_closed, mark_price)
         atr = compute_atr(df_live).iloc[-1] if len(df_live) > 14 else mark_price * 0.01
@@ -5983,18 +6013,68 @@ def apply_profit_engine(symbol, current_price, df, idx, position_state):
         return "HOLD"
     price = float(current_price or 0.0)
 
-    tp1 = float(position_state.get("tp1_price", position_state.get("synthetic_tp1", 0.0)) or 0.0)
-    tp2 = float(position_state.get("tp2_price", 0.0) or 0.0)
-    valid_tp1 = (side == "BUY" and tp1 > entry and price >= tp1) or (side == "SELL" and tp1 < entry and price <= tp1)
-    valid_tp2 = (side == "BUY" and tp2 > tp1 > entry and price >= tp2) or (side == "SELL" and tp2 < tp1 < entry and price <= tp2)
+    # SINGLE SOURCE OF TRUTH for targets (professional fix): resolve TP1/TP2 in
+    # the SAME order the portfolio dashboard uses (canonical_position_payload,
+    # portfolio/manager.py): *_price, then synthetic_*, then dynamic_*. The
+    # engine previously read *_price with a bare get(), so a position whose
+    # stored *_price was 0 (e.g. an adopted/restored/manually adopted position
+    # reconciled through _reconcile_levels_after_fill, which can leave
+    # tp1_price=0 while synthetic_tp1/dynamic_tp1 stay valid) had TP1 and TP2
+    # permanently disabled even though the dashboard showed a live target at
+    # 100% progress.
+    def _resolve_target(prefix):
+        for _k in (f"{prefix}_price", f"synthetic_{prefix}", f"dynamic_{prefix}"):
+            _v = float(position_state.get(_k, 0.0) or 0.0)
+            if _v > 0:
+                return _v
+        return 0.0
+
+    tp1 = _resolve_target("tp1")
+    tp2 = _resolve_target("tp2")
+
+    # Wick-aware touch detection (professional fix): a target is reached when
+    # the (fresh) sampled mark touches it OR the last in-progress candle's
+    # high/low touched it. get_live_hybrid_df() already accumulates the live
+    # wick into the last candle, so this closes the sampled-mark-only gap where
+    # a brief touch between 2-10s samples was never observed (progress could
+    # read 100% and profit was still never booked).
+    df_touch = df if isinstance(df, pd.DataFrame) and len(df) else None
+    if df_touch is not None:
+        try:
+            last_high = float(df_touch['high'].iloc[-1])
+        except Exception:
+            last_high = 0.0
+        try:
+            last_low = float(df_touch['low'].iloc[-1])
+        except Exception:
+            last_low = 0.0
+    else:
+        last_high = 0.0
+        last_low = 0.0
+    if side == "BUY":
+        touched1 = (price > 0 and price >= tp1) or (last_high > 0 and last_high >= tp1)
+        touched2 = (price > 0 and price >= tp2) or (last_high > 0 and last_high >= tp2)
+        valid_tp1 = tp1 > entry and touched1
+        valid_tp2 = tp2 > tp1 and tp2 > entry and touched2
+    else:
+        touched1 = (price > 0 and price <= tp1) or (last_low > 0 and last_low <= tp1)
+        touched2 = (price > 0 and price <= tp2) or (last_low > 0 and last_low <= tp2)
+        valid_tp1 = tp1 < entry and touched1
+        valid_tp2 = tp2 < tp1 and tp2 < entry and touched2
     dirv = 1 if side == "BUY" else -1
     pnl_pct = dirv * (price - entry) / entry * 100.0
 
     if not position_state.get("tp1_hit", False) and valid_tp1:
         # TP1 = 50% of the ORIGINAL position. close_partial() computes the
         # quantity from remaining_qty, which equals qty_initial before TP1.
+        # Defensive heal: adopted/restored states can lack remaining_qty (or a
+        # trailing reconcile can momentarily zero it); derive it from the
+        # original size so a genuine TP1 touch is never silently blocked.
         if float(position_state.get("remaining_qty", 0.0) or 0.0) <= 0:
-            return "HOLD"
+            _heal = float(position_state.get("qty_initial") or position_state.get("qty") or 0.0)
+            if _heal <= 0:
+                return "HOLD"
+            position_state["remaining_qty"] = _heal
         try:
             position_state["mark_price"] = price
         except Exception:
