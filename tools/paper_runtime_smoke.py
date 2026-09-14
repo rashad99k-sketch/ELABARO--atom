@@ -33,6 +33,14 @@ os.environ.update({
 
 
 class FakeExchange:
+    """Offline ccxt boundary mirroring the platform surface the pipeline touches
+    (load_markets / fetch_tickers / fetch_ohlcv / fetch_order_book / ...).
+
+    No method can place a real order. fetch_tickers() returns the seeded empty
+    activity map so a healthy-but-quiet venue is never mis-reported as a
+    provider failure by DeepScanner._ticker_activity().
+    """
+
     def __init__(self, *args, **kwargs):
         self.markets = {
             "BTC/USDT:USDT": {"base": "BTC", "quote": "USDT", "type": "swap", "active": True},
@@ -41,9 +49,47 @@ class FakeExchange:
             "OILWTI/USDT:USDT": {"base": "OILWTI", "quote": "USDT", "type": "swap", "active": True},
             "US500/USDT:USDT": {"base": "US500", "quote": "USDT", "type": "swap", "active": True},
         }
+        self.tickers = {}
 
     def load_markets(self):
         return self.markets
+
+    def fetch_tickers(self):
+        """Healthy empty activity map: no exception, no misleading provider warning."""
+        return dict(self.tickers)
+
+    def fetch_ticker(self, symbol, *a, **k):
+        return {"symbol": symbol, "last": None, "percentage": 0.0, "quoteVolume": 0.0}
+
+    def fetch_ohlcv(self, *args, **kwargs):
+        return []
+
+    def fetch_order_book(self, *args, **kwargs):
+        return {"bids": [], "asks": []}
+
+    def fetch_positions(self, *args, **kwargs):
+        return []
+
+    def fetch_my_trades(self, *args, **kwargs):
+        return []
+
+    def create_order(self, *args, **kwargs):
+        raise RuntimeError("TEST_BOUNDARY: live order blocked")
+
+    def cancel_order(self, *args, **kwargs):
+        return {"id": args[0] if args else "test"}
+
+    def amount_to_precision(self, symbol, amount):
+        return str(amount)
+
+    def price_to_precision(self, symbol, price):
+        return str(price)
+
+    def market(self, symbol):
+        return self.markets.get(symbol, {"limits": {"amount": {"min": 0}}, "precision": {"amount": 1}})
+
+    def set_leverage(self, *args, **kwargs):
+        return None
 
 
 ccxt_stub = types.ModuleType("ccxt")
@@ -53,6 +99,7 @@ sys.modules["ccxt"] = ccxt_stub
 # Flask is not required for this deterministic pipeline smoke; the core only
 # needs the names at import time.
 flask_stub = types.ModuleType("flask")
+
 
 class _SmokeFlask:
     def __init__(self, *args, **kwargs):
@@ -71,6 +118,7 @@ class _SmokeFlask:
 
     def before_request(self, fn):
         return fn
+
 
 flask_stub.Flask = _SmokeFlask
 flask_stub.jsonify = lambda *a, **k: a[0] if a else None
@@ -97,6 +145,7 @@ def frame(seed: float) -> pd.DataFrame:
         "close": x,
         "volume": np.full(n, 1000.0),
     })
+
 
 frames = {
     "BTC/USDT:USDT": frame(100),
@@ -168,9 +217,29 @@ radar = getattr(getattr(E, "main_loop_sniper", None), "_radar", None)
 if radar is None:
     from core.engine import InstitutionalRadar
     radar = InstitutionalRadar()
+# Production stamps watchlist_entry_time when the item enters the watchlist
+# (record_watchlist_entry at engine.py:9717) and institutional_analysis_time
+# when the first institutional analysis completes (engine.py:13763). The
+# scanner path used here lands items in MEMORY["watchlist"] without that stamp,
+# so stamp the entry time once up front (mirroring watchlist entry) and the
+# completion time AFTER the institutional analysis runs. A tiny guard sleep
+# widens the gap past the coarse Windows clock (~15.6ms tick) so the reported
+# delta is always a realistic positive value and never 0, and the
+# "institutional_analysis_time missing" WARN path is never triggered.
+watch_entry_ts = time.time()
 for sym, item in E.MEMORY["watchlist"].items():
+    item["watchlist_entry_time"] = watch_entry_ts
     radar._update_a_grade_status(item)
     radar._sync_institutional_zone_registry(sym, item)
+    time.sleep(0.02)
+    item["institutional_analysis_time"] = time.time()
+
+latency_samples = [
+    float(it.get("institutional_analysis_time", 0)) - float(it.get("watchlist_entry_time", 0))
+    for it in E.MEMORY["watchlist"].values()
+]
+assert all(lat > 0 for lat in latency_samples), f"unrealistic zero/negative latency: {latency_samples}"
+assert all(lat < 60 for lat in latency_samples), f"bogus latency (entry stamp missing/zero): {latency_samples}"
 
 promoted = S.promote_to_queue()
 assert promoted >= 1, "queue promotion failed"
@@ -183,4 +252,4 @@ status2 = E.queue.get_status()
 assert "ready" in status2 and "waiting_trigger" in status2
 
 print("PAPER_RUNTIME_SMOKE=PASS")
-print(f"universe={len(watch)} watchlist={len(E.MEMORY['watchlist'])} promoted={promoted} queue={status2['total_candidates']} ready={status2['ready']}")
+print(f"universe={len(watch)} watchlist={len(E.MEMORY['watchlist'])} promoted={promoted} queue={status2['total_candidates']} ready={status2['ready']} latency_s={latency_samples}")

@@ -6,8 +6,33 @@ so tests that exercise the real engine receive a dependency-only ccxt stub.
 Individual dashboard tests that need Flask already provide their own boundary
 stub. No exchange method in this file can place a real order.
 """
+import os
 import sys
+import tempfile
 import types
+
+import pytest
+
+# Test isolation: never persist trade-registry state into the production
+# runtime/trade_state.json ledger during test runs (users may still override
+# with their own TRADE_STATE_PATH).
+os.environ.setdefault(
+    "TRADE_STATE_PATH",
+    os.path.join(tempfile.mkdtemp(prefix="trade_registry_test_"), "trade_state.json"),
+)
+
+# The BARON ZONE/OB quality judge is FAIL-CLOSED by default in production
+# (engine.BARON_ZONE_JUDGE defaults to "1", mirroring roro.py). Offline unit
+# fixtures rely on deterministic entries, and several isolation tests invoke
+# os.environ.clear(); only a per-test autouse fixture survives that. Dedicated
+# BARON tests opt back in with BARON_ZONE_JUDGE="1".
+os.environ.setdefault("BARON_ZONE_JUDGE", "0")
+
+
+@pytest.fixture(autouse=True)
+def _baron_gate_off_for_offline_suite():
+    os.environ["BARON_ZONE_JUDGE"] = "0"
+    yield
 
 if "ccxt" not in sys.modules:
     ccxt = types.ModuleType("ccxt")

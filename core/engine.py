@@ -160,6 +160,7 @@ import pandas as pd
 import numpy as np
 from flask import Flask, jsonify, request
 import requests
+import hmac
 
 # Market-session context is pure/read-only and never places orders.
 try:
@@ -8620,6 +8621,44 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
                              "No valid OHLCV for entry", side, score)
         return False
 
+    # ===== BARON ZONE/OB QUALITY JUDGE (additive gate; RORO entry logic untouched) =====
+    # Mirrors the roro.py execute_entry contract: FAIL-CLOSED by default (env
+    # BARON_ZONE_JUDGE != "0"). Any judge decision other than ENTER_NOW — or any
+    # evaluation error — blocks the entry. Offline unit tests pin this gate OFF
+    # via conftest unless a dedicated test opts in explicitly.
+    if os.environ.get("BARON_ZONE_JUDGE", "1") != "0":
+        try:
+            import sys as _bj_sys
+            try:
+                import baron_zone_judge as _baron_judge
+            except Exception:
+                _bj_path = os.environ.get("BARON_ZONE_JUDGE_PATH", "")
+                if _bj_path and _bj_path not in _bj_sys.path:
+                    _bj_sys.path.insert(0, _bj_path)
+                import baron_zone_judge as _baron_judge
+            _bj_verdict = _baron_judge.assess(
+                symbol=symbol, side=side, df=df, atr=atr_val, price=price,
+                ctx={"entry_type": entry_type or "", "classification": classification or ""})
+            log_execution(
+                f"[BARON_JUDGE] {symbol} {side} -> {_bj_verdict.decision} "
+                f"| score={_bj_verdict.final_zone_score} | "
+                f"{_bj_verdict.main_blocker or _bj_verdict.pending_reason}",
+                "WARN" if _bj_verdict.decision != "ENTER_NOW" else "INFO",
+                debounce_key=f"baron_judge_{symbol}", debounce_sec=30)
+            if _bj_verdict.decision != "ENTER_NOW":
+                _record_exec_blocker(symbol, "BARON_REJECT",
+                                     f"decision={_bj_verdict.decision} "
+                                     f"score={_bj_verdict.final_zone_score} "
+                                     f"blocker={_bj_verdict.main_blocker or _bj_verdict.pending_reason}",
+                                     side, score)
+                return False
+        except Exception as _bj_err:
+            log_execution(f"[BARON_JUDGE] FAIL-CLOSED, entry blocked: {_bj_err}", "WARN",
+                          debounce_key="baron_judge_error", debounce_sec=300)
+            _record_exec_blocker(symbol, "BARON_ERROR", f"fail-closed: {_bj_err}",
+                                 side, score)
+            return False
+
     try:
         STATE["position_setup_snapshot"] = _build_entry_setup_snapshot(symbol, side, df, price, atr_val, context)
         _setup = STATE["position_setup_snapshot"]
@@ -11163,6 +11202,21 @@ def decision_score(df, ob, atr_val, side):
 # ========== FLASK DASHBOARD ==========
 app = Flask(__name__)
 
+# Manual trading controls (engine routes) are local-only unless an explicit
+# control token is configured, mirroring dashboard/app.py. This prevents a
+# public deployment of the engine web surface from opening /trade or /close.
+DASHBOARD_CONTROL_TOKEN = os.getenv("DASHBOARD_CONTROL_TOKEN", "").strip()
+
+def _control_authorized():
+    remote = str(getattr(request, "remote_addr", "") or "")
+    if not DASHBOARD_CONTROL_TOKEN and remote in {"127.0.0.1", "::1", "localhost"}:
+        return True
+    supplied = request.headers.get("X-Dashboard-Token", "")
+    if not supplied:
+        body = request.get_json(silent=True) or {}
+        supplied = str(body.get("control_token", ""))
+    return bool(DASHBOARD_CONTROL_TOKEN) and hmac.compare_digest(supplied, DASHBOARD_CONTROL_TOKEN)
+
 def render_live_supervisor_panel():
     return """
     <div id="rf-live-panel" style="display:none;" class="rf-live-supervisor">
@@ -11905,6 +11959,8 @@ def data():
 
 @app.route("/trade", methods=["POST"])
 def manual_trade():
+    if not _control_authorized():
+        return jsonify({"error": "Manual control authentication required"}), 403
     data = request.json
     side = data.get("side")
     if not side or side not in ["BUY","SELL"]:
@@ -11932,16 +11988,21 @@ def manual_trade():
 
 @app.route("/close", methods=["POST"])
 def manual_close():
+    if not _control_authorized():
+        return jsonify({"error": "Manual control authentication required"}), 403
     if not STATE["open"]:
         return jsonify({"error": "No position"}),400
     price = get_ticker_safe(STATE["current_symbol"])
     STATE["close_reason"] = "MANUAL_CLOSE"
-    if price:
-        finalize_trade_with_reality(STATE["current_symbol"])
-    else:
-        close_position_full()
-        finalize_trade_with_reality(STATE["current_symbol"])
-    return jsonify({"message": "Closed"}),200
+    # Verified close path: close_position_full() handles paper (exact price +
+    # margin release) AND live (venue reduce-only order + fill verification +
+    # state sync) and calls finalize_trade_with_reality internally. Calling
+    # finalize again here would double-book the trade. Fixes the previous
+    # inversion where a live close with an available ticker book-kept locally
+    # without ever sending the reduce-only order, and the recovery scan
+    # re-adopted the still-open venue position.
+    ok = close_position_full(close_price=price, stage="MANUAL")
+    return jsonify({"message": "Closed" if ok else "Close failed"}),200 if ok else 500
 
 @app.route("/health")
 def health():
