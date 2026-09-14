@@ -10381,9 +10381,86 @@ def update_stats(pnl_pct):
     total = DASHBOARD_STATE["stats"]["trades"]
     DASHBOARD_STATE["stats"]["win_rate"] = (DASHBOARD_STATE["stats"]["wins"] / total * 100) if total else 0
 
+_live_wallet_baseline = None
+
+def _live_wallet_total():
+    """Current live wallet total, read-only: never writes or refreshes the
+    shared 10s balance cache, so it cannot perturb the risk gate's day-start
+    equity snapshot."""
+    if PAPER_MODE:
+        return 0.0
+    try:
+        bal = cache_get("balance", 10)
+    except Exception:
+        bal = None
+    if bal is not None:
+        try:
+            return float(bal)
+        except (TypeError, ValueError):
+            return 0.0
+    return 0.0
+
+
+def _wallet_baseline():
+    """Reference balance the live-wallet PnL is measured against.
+
+    Priority: INITIAL_BALANCE env (real deposit), else the first successfully
+    observed live wallet total. None in paper or offline.
+    """
+    global _live_wallet_baseline
+    if PAPER_MODE:
+        return None
+    if _live_wallet_baseline is None:
+        env_base = os.getenv("INITIAL_BALANCE")
+        if env_base:
+            try:
+                env_base = float(env_base)
+            except (TypeError, ValueError):
+                env_base = None
+            if env_base and env_base > 0:
+                _live_wallet_baseline = env_base
+    if _live_wallet_baseline is None:
+        bal = _live_wallet_total()
+        if bal and bal > 0:
+            _live_wallet_baseline = bal
+    return _live_wallet_baseline
+
+
+def live_wallet_pnl():
+    """Real-wallet total PnL in live mode; None in paper or when unavailable."""
+    if PAPER_MODE:
+        return None
+    base = _wallet_baseline()
+    if base is None:
+        return None
+    bal = _live_wallet_total()
+    if not bal or bal <= 0:
+        return None
+    bal = float(bal)
+    return bal, bal - base, (bal - base) / base * 100.0
+
+
+def _set_wallet_pnl_memory(real_pnl, real_pnl_pct):
+    """Mirror the total-PnL view into MEMORY, preferring the live wallet basis."""
+    wallet = live_wallet_pnl()
+    if wallet is not None:
+        MEMORY["total_pnl"] = wallet[1]
+        MEMORY["total_pnl_pct"] = wallet[2]
+    else:
+        MEMORY["total_pnl"] = real_pnl
+        MEMORY["total_pnl_pct"] = real_pnl_pct
+
+
 def get_dashboard_metrics():
     winrate = (PERF["wins"] / PERF["trades"] * 100) if PERF["trades"] else 0
-    total_pnl = PERF["total_pnl_pct"] * 100
+    wallet = live_wallet_pnl()
+    if wallet is not None:
+        total_pnl_pct = wallet[2]
+        total_pnl_usdt = wallet[1]
+    else:
+        total_pnl_pct = PERF["total_pnl_pct"] * 100
+        total_pnl_usdt = PERF["total_pnl_usdt"]
+    total_pnl = f"{total_pnl_pct:+.2f}%"
     last = PERF["last_trade"]
     last_txt = "N/A"
     if last:
@@ -10391,8 +10468,8 @@ def get_dashboard_metrics():
         last_txt = f'{last["result"]} ({sign}{last["pnl_pct"]:.2f}%)'
     return {
         "winrate": f"{winrate:.1f}%",
-        "total_pnl": f"{total_pnl:+.2f}%",
-        "total_pnl_usdt": PERF["total_pnl_usdt"],
+        "total_pnl": total_pnl,
+        "total_pnl_usdt": total_pnl_usdt,
         "last_trade": last_txt,
         "trades": PERF["trades"],
         "wins": PERF["wins"],
@@ -12130,8 +12207,7 @@ def sync_all_states():
             MEMORY["position_status"] = "OPEN"
             MEMORY["current_position"] = real_pos
         real_pnl, real_pnl_pct = get_realized_pnl_for_symbol(DEFAULT_SYMBOL, lookback_seconds=30)
-        MEMORY["total_pnl"] = real_pnl
-        MEMORY["total_pnl_pct"] = real_pnl_pct
+        _set_wallet_pnl_memory(real_pnl, real_pnl_pct)
         return
     valid = validate_position_state(STATE, symbol)
     if valid is None:
@@ -12152,11 +12228,7 @@ def sync_all_states():
         MEMORY["position_status"] = "OPEN"
         MEMORY["current_position"] = valid
     real_pnl, real_pnl_pct = get_realized_pnl_for_symbol(symbol)
-    MEMORY["total_pnl"] = real_pnl
-    MEMORY["total_pnl_pct"] = real_pnl_pct
-    if "total_pnl_usdt" in PERF:
-        PERF["total_pnl_usdt"] = real_pnl
-        PERF["total_pnl_pct"] = real_pnl_pct / 100
+    _set_wallet_pnl_memory(real_pnl, real_pnl_pct)
 
 def validate_position_state(local_pos, symbol):
     real_pos = fetch_position(symbol)
