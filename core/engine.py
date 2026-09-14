@@ -11766,7 +11766,13 @@ def data():
             "free_balance": free_bal,
             "avail_margin": avail_margin,
             "mode": mode,
-            "stats": DASHBOARD_STATE["stats"],
+            "stats": {
+                "trades": PERF.get("trades", 0),
+                "wins": PERF.get("wins", 0),
+                "losses": PERF.get("losses", 0),
+                "win_rate": (PERF.get("wins", 0) / PERF.get("trades", 0) * 100)
+                            if PERF.get("trades", 0) else 0.0,
+            },
             "position": pos,
             "logs": DASHBOARD_STATE["logs"][-30:],
             "errors": DASHBOARD_STATE["errors"][-10:],

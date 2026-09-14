@@ -32,6 +32,12 @@ class LiveWalletPnlMetricsTest(unittest.TestCase):
             "validate_position_state": E.validate_position_state,
             "PERF": dict(E.PERF),
             "INITIAL_BALANCE": os.environ.get("INITIAL_BALANCE"),
+            "STATE": dict(E.STATE),
+            "TRADE_STATE": dict(E.TRADE_STATE),
+            "MEMORY_KEYS": {k: E.MEMORY.get(k)
+                            for k in ("total_pnl", "total_pnl_pct",
+                                      "position_status", "current_position",
+                                      "entry", "sl", "tp")},
             "balance_cache": dict(E.CACHE.get("balance", {}) or {}),
         }
         E._live_wallet_baseline = None
@@ -53,6 +59,13 @@ class LiveWalletPnlMetricsTest(unittest.TestCase):
         E.fetch_position = self._saved["fetch_position"]
         E.validate_position_state = self._saved["validate_position_state"]
         E.PERF.clear(); E.PERF.update(self._saved["PERF"])
+        E.STATE.clear(); E.STATE.update(self._saved["STATE"])
+        E.TRADE_STATE.clear(); E.TRADE_STATE.update(self._saved["TRADE_STATE"])
+        for k, v in self._saved["MEMORY_KEYS"].items():
+            if v is None:
+                E.MEMORY.pop(k, None)
+            else:
+                E.MEMORY[k] = v
         if self._saved["balance_cache"]:
             E.CACHE["balance"] = dict(self._saved["balance_cache"])
         else:
