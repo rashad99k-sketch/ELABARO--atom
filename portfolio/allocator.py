@@ -132,7 +132,13 @@ class GlobalAssetAllocator:
                     allowed = False
                     reason = "SLOT_CAP"
                 class_cap = self.CLASS_CAPS.get(cls, 0)
-                side_cap = self.SIDE_CAPS.get(side, 0)
+                # Per-direction cap. Env-overridable (MAX_BUY_POSITIONS /
+                # MAX_SELL_POSITIONS) exactly like MAX_TECHNICAL_POSITIONS, so an
+                # operator may raise the symmetric 4/4 default (e.g. a pure
+                # one-direction day) without a code change. Default stays 4/4.
+                default_side = self.SIDE_CAPS.get(side, 0) or 4
+                side_cap = max(1, min(limit, int(os.getenv(
+                    f"MAX_{side}_POSITIONS", str(default_side)))))
                 if class_bias.get(cls, 0) >= class_cap:
                     allowed = False
                     reason = f"{cls}_CAP"

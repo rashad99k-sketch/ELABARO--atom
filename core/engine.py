@@ -8519,6 +8519,18 @@ def _record_exec_blocker(symbol, blocker, reason="", side="", score=0.0,
             record_gate_event(symbol, stage, blocker, str(reason), side)
         except Exception:
             pass
+        # Terminal lifecycle event: an OPEN_REQUESTED must never dangle without
+        # a resolved outcome. Emitted once (flag consumed) so the dashboard
+        # lifecycle never shows a phantom pending open after a hard rejection.
+        try:
+            if isinstance(_st, dict) and _st.get("exec_open_requested"):
+                _trade_event("OPEN_REJECTED", blocker=blocker,
+                             reason=str(reason)[:220], stage=stage,
+                             side=side, score=entry["score"])
+                _st["exec_open_requested"] = False
+                _st["last_open_outcome"] = f"OPEN_REJECTED:{blocker}"
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -8604,6 +8616,12 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         except Exception:
             STATE["setup_edge"] = {"available": False, "score": None, "samples": 0}
     _trade_event("OPEN_REQUESTED", side=side, entry_price=price, score=score, trade_type=trade_type, maturity=STATE.get("move_maturity"))
+    # Every OPEN_REQUESTED must resolve to a durable terminal outcome
+    # (OPEN_REJECTED from the gate chain below, or OPEN_CONFIRMED on fill). The
+    # flag is consumed as a single-slot guard by _record_exec_blocker so a
+    # rejection is never recorded without its matching request in this process.
+    STATE["exec_open_requested"] = True
+    STATE["last_open_outcome"] = "OPEN_REQUESTED"
     df = get_ohlcv_safe(symbol, INSTITUTIONAL_OHLCV_DEPTH)
     # Execution only needs the canonical OHLCV columns. Timestamp is required
     # by exchange-fetch validation, but it is not an execution prerequisite
@@ -8623,9 +8641,25 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
 
     # ===== BARON ZONE/OB QUALITY JUDGE (additive gate; RORO entry logic untouched) =====
     # Mirrors the roro.py execute_entry contract: FAIL-CLOSED by default (env
-    # BARON_ZONE_JUDGE != "0"). Any judge decision other than ENTER_NOW — or any
-    # evaluation error — blocks the entry. Offline unit tests pin this gate OFF
-    # via conftest unless a dedicated test opts in explicitly.
+    # BARON_ZONE_JUDGE != "0"). DIRECTIONAL FAILURE IS PRESERVED:
+    #   * BLOCK verdicts (zone broken, price extended, OB consumed/invalidated,
+    #     S/R flip, unusable data) and evaluation errors hard-block EVERY
+    #     candidate — READY-validated or not. A genuinely broken location is
+    #     never overridden by the queue.
+    #   * WAIT_RETEST is the judge's own "zone is VALID, retest pending" soft
+    #     verdict (baron_zone_judge.py line 9). The queue's READY authority has
+    #     ALREADY answered the retest/confirmation/timing question
+    #     (in-entry-window + trigger + confirmation + not-extended, re-verified
+    #     every QUEUE_RE_EVAL_INTERVAL). Applying the judge's separate score bar
+    #     (final_zone_score >= 72 + struct_ok + rejection/displacement/sweep)
+    #     on top of a fresh READY grant makes WAIT_RETEST a SECOND, duplicated
+    #     threshold — the exact defect class that turned queue-READY candidates
+    #     into dashboard OPEN_REQUESTED events with zero executions. Under the
+    #     SAME _ready_execution_grace used by the ADX and liquidity re-checks
+    #     below, a fresh READY-validated grant treats WAIT_RETEST as ADVISORY
+    #     evidence; non-READY / fallback / stale grants remain hard-blocked.
+    # Offline unit tests pin this gate OFF via conftest unless a dedicated test
+    # opts in explicitly.
     if os.environ.get("BARON_ZONE_JUDGE", "1") != "0":
         try:
             import sys as _bj_sys
@@ -8639,19 +8673,48 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
             _bj_verdict = _baron_judge.assess(
                 symbol=symbol, side=side, df=df, atr=atr_val, price=price,
                 ctx={"entry_type": entry_type or "", "classification": classification or ""})
+            _bj_grace, _bj_grace_sec = _ready_execution_grace(context)
             log_execution(
                 f"[BARON_JUDGE] {symbol} {side} -> {_bj_verdict.decision} "
                 f"| score={_bj_verdict.final_zone_score} | "
                 f"{_bj_verdict.main_blocker or _bj_verdict.pending_reason}",
                 "WARN" if _bj_verdict.decision != "ENTER_NOW" else "INFO",
                 debounce_key=f"baron_judge_{symbol}", debounce_sec=30)
-            if _bj_verdict.decision != "ENTER_NOW":
+            if _bj_verdict.decision == "BLOCK":
+                # Objective location invalidation: fail-closed for EVERY
+                # candidate. Neither READY nor the queue overrides structural
+                # damage; the judge remains the location safety authority.
                 _record_exec_blocker(symbol, "BARON_REJECT",
-                                     f"decision={_bj_verdict.decision} "
-                                     f"score={_bj_verdict.final_zone_score} "
+                                     f"decision=BLOCK score={_bj_verdict.final_zone_score} "
                                      f"blocker={_bj_verdict.main_blocker or _bj_verdict.pending_reason}",
                                      side, score)
                 return False
+            if _bj_verdict.decision != "ENTER_NOW":  # WAIT_RETEST: zone is VALID
+                if _bj_grace:
+                    # READY-execution grace contract (identical to the ADX and
+                    # liquidity re-checks): the queue's READY authority already
+                    # validated the zone is in its entry window, the
+                    # trigger/confirmation is complete and price is not
+                    # extended. WAIT_RETEST becomes advisory; it can never
+                    # silently kill a freshly READY grant.
+                    log_execution(
+                        f"[BARON_JUDGE] {symbol} {side} WAIT_RETEST admitted by "
+                        f"READY-execution grace ({_bj_grace_sec:.0f}s) | "
+                        f"score={_bj_verdict.final_zone_score}", "WARN",
+                        debounce_key=f"baron_grace_{symbol}", debounce_sec=30)
+                    record_gate_event(symbol, "EXECUTION", "BARON_ADVISORY",
+                                      f"judge={_bj_verdict.decision} "
+                                      f"score={_bj_verdict.final_zone_score} "
+                                      f"reason=READY grace {_bj_grace_sec:.0f}s", side)
+                else:
+                    # Non-READY / fallback / stale grant: the judge stays the
+                    # only zone-quality checkpoint -> fail-closed.
+                    _record_exec_blocker(symbol, "BARON_REJECT",
+                                         f"decision={_bj_verdict.decision} "
+                                         f"score={_bj_verdict.final_zone_score} "
+                                         f"blocker={_bj_verdict.main_blocker or _bj_verdict.pending_reason}",
+                                         side, score)
+                    return False
         except Exception as _bj_err:
             log_execution(f"[BARON_JUDGE] FAIL-CLOSED, entry blocked: {_bj_err}", "WARN",
                           debounce_key="baron_judge_error", debounce_sec=300)
@@ -9087,6 +9150,10 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         log_execution(f"PAPER {entry_type} {side} {qty:.6f} @ {price} | {trade_type_label} | {reason}", "SUCCESS")
         tg_entry(side, symbol, price, sl, tp1, score, reason, entry_type)
         log_execution(f"[EXECUTION] {symbol} {side} executed (paper) at {price:.4f}", "SUCCESS")
+        _trade_event("OPEN_CONFIRMED", mode="PAPER", side=side, entry_price=price,
+                     qty=qty)
+        STATE["exec_open_requested"] = False
+        STATE["last_open_outcome"] = "OPEN_CONFIRMED"
         return True
 
     if not _native_protection_gate_ok(symbol, side, score, adx_val):
@@ -9170,6 +9237,10 @@ def execute_entry(side, symbol, price, sl, tp1, tp2, score, reason, atr_val, tra
         log_execution(f"LIVE {entry_type} {side} {qty:.6f} @ {price} | {trade_type_label} | {reason}", "SUCCESS")
         tg_entry(side, symbol, price, sl, tp1, score, reason, entry_type)
         log_execution(f"[EXECUTION] {symbol} {side} executed at {price:.4f}", "SUCCESS")
+        _trade_event("OPEN_CONFIRMED", mode="LIVE", side=side, entry_price=price,
+                     qty=qty)
+        STATE["exec_open_requested"] = False
+        STATE["last_open_outcome"] = "OPEN_CONFIRMED"
         time.sleep(1)
         sync_position_state(symbol)
         _reconcile_levels_after_fill(STATE.get("entry", price), symbol, side, trade_type,

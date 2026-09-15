@@ -342,6 +342,19 @@ def _execute_ready_queue_candidate():
     if not USE_EXECUTION_QUEUE:
         return False
 
+    # User-facing capacity labels mapped from the allocator's internal reasons.
+    # Kept additive: internal reason strings (TECHNICAL_CAP, *_CAP, SLOT_CAP -
+    # pinned by existing tests) are never rewritten, only surfaced alongside.
+    PORTFOLIO_REASON_USER = {
+        "SLOT_CAP": "TOTAL_PORTFOLIO_CAPACITY_FULL",
+        "TECHNICAL_CAP": "TECHNICAL_CAPACITY_FULL",
+        "CRYPTO_CAP": "CRYPTO_SLOT_FULL",
+        "INDEX_CAP": "INDEX_SLOT_FULL",
+        "GOLD_CAP": "GOLD_SLOT_FULL",
+        "OIL_CAP": "OIL_SLOT_FULL",
+        "NEWS_CAP": "NEWS_SLOT_FULL",
+    }
+
     exec_pipe = MEMORY.setdefault("pipeline", {}).setdefault("execution", {})
     def _exec_gate(outcome):
         exec_pipe[outcome] = exec_pipe.get(outcome, 0) + 1
@@ -366,6 +379,8 @@ def _execute_ready_queue_candidate():
     slots = PORTFOLIO.max_positions - PORTFOLIO.count()
     if slots <= 0:
         _exec_gate("no_slots")
+        exec_pipe["last_reject_reason"] = "SLOT_CAP"
+        exec_pipe["last_reject_reason_user"] = "TOTAL_PORTFOLIO_CAPACITY_FULL"
         return False
 
     try:
@@ -456,8 +471,11 @@ def _execute_ready_queue_candidate():
                 if not decision.allowed:
                     MEMORY["portfolio_allocation"] = alloc_report.to_dict()
                     _exec_gate("allocator_reject")
+                    _reason_user = PORTFOLIO_REASON_USER.get(decision.reason, decision.reason)
+                    exec_pipe["last_reject_reason"] = decision.reason
+                    exec_pipe["last_reject_reason_user"] = _reason_user
                     E.record_gate_event(candidate["symbol"], "RISK", "ALLOCATOR_REJECT",
-                                        decision.reason, candidate["side"])
+                                        f"{decision.reason} ({_reason_user})", candidate["side"])
                     log_execution(
                         f"[PORTFOLIO] {candidate['symbol']} rejected: {decision.reason}",
                         "INFO",
@@ -502,6 +520,21 @@ def _execute_ready_queue_candidate():
         _exec_gate("open_candidate_failed")
     except Exception as exc:
         log_execution(f"[QUEUE] ready execution error: {exc}", "ERROR")
+        # A swallowed exception here used to leave the candidate READY and emit
+        # a fresh OPEN_REQUESTED every re-eval tick with NO visible outcome.
+        # Surface the failure in the gate feed + lifecycle so it can never
+        # silently disappear; the queue clean-up still governs retry cadence.
+        _best = locals().get("best")
+        if _best is not None:
+            try:
+                E.record_gate_event(_best.symbol, "EXECUTION", "EXECUTION_ERROR",
+                                    f"ready execution raised: {str(exc)[:180]}", _best.side)
+                _lc = MEMORY.setdefault("opportunity_lifecycle", {}).setdefault(_best.symbol, {})
+                _lc["primary_blocker"] = "EXECUTION_ERROR"
+                _lc["execution_error"] = str(exc)[:220]
+            except Exception:
+                pass
+        _exec_gate("execution_error")
     return False
 
 
@@ -542,11 +575,15 @@ def execute_news_slot():
     # Global slot cap: total open positions must stay <= MAX_OPEN_POSITIONS.
     if PORTFOLIO.max_positions - PORTFOLIO.count() <= 0:
         _gate("news_no_slots")
+        exec_pipe["last_reject_reason"] = "SLOT_CAP"
+        exec_pipe["last_reject_reason_user"] = "TOTAL_PORTFOLIO_CAPACITY_FULL"
         return False
 
     # NEWS slot is capped at 1 open news position (independent of class caps).
     if news_slot.count_open_news(PORTFOLIO) >= 1:
         _gate("news_slot_full")
+        exec_pipe["last_reject_reason"] = "NEWS_CAP"
+        exec_pipe["last_reject_reason_user"] = "NEWS_SLOT_FULL"
         return False
 
     watchlist = MEMORY.get("watchlist", {}) or {}
@@ -570,6 +607,21 @@ def execute_news_slot():
         _gate("news_waiting_reaction")
         return False
     cand["news_reaction"] = {"status": "CONFIRMED", **reaction}
+
+    # The NEWS slot is the qualification authority for its candidate: headline
+    # bias + confirmed directional market reaction + news-risk chain. Mark the
+    # candidate READY-validated so the BARON judge's soft WAIT_RETEST verdict
+    # is advisory here too (BLOCK verdicts stay fail-closed); otherwise the
+    # independent news slot would be silently killed by the same hidden
+    # secondary threshold that blocked technical READY candidates.
+    try:
+        cand.setdefault("execution_context", {})
+        if not cand.get("execution_context"):
+            cand["execution_context"] = {}
+        cand["execution_context"].setdefault("is_ready_validated", True)
+        cand["execution_context"].setdefault("ready_ts", time.time())
+    except Exception:
+        pass
 
     try:
         if PORTFOLIO.open_candidate(cand):
