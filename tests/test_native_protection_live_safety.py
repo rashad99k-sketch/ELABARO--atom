@@ -33,6 +33,8 @@ os.environ.setdefault("BINGX_SECRET", "")
 os.environ.setdefault("NEWS_ENABLED", "True")
 
 import core.engine as E  # noqa: E402
+import core.config_loader as cl  # noqa: E402
+import portfolio.native_protection as _portfolio_np  # noqa: E402
 
 
 class _FakeNativeProtection:
@@ -321,6 +323,150 @@ class ConfigLoaderTest(unittest.TestCase):
                 os.environ.pop("ENABLE_NATIVE_PROTECTION", None)
             else:
                 os.environ["ENABLE_NATIVE_PROTECTION"] = saved
+
+
+# ---- L. Exact-production regression: EMPTY env + .env merged through the REAL
+# engine bootstrap path (loader -> engine hydrate -> gate). No fakes, no helper-
+# in-isolation shortcut: this reproduces the production failure and proves the
+# fix end-to-end through the actual configuration path used at startup.
+class BootstrapConfigPathRegressionTest(unittest.TestCase):
+
+    def setUp(self):
+        self._env_saved = {
+            "ENABLE_NATIVE_PROTECTION": os.environ.get("ENABLE_NATIVE_PROTECTION"),
+            "REQUIRE_NATIVE_PROTECTION_LIVE": os.environ.get("REQUIRE_NATIVE_PROTECTION_LIVE"),
+        }
+        for k in self._env_saved:
+            os.environ.pop(k, None)
+        self._saved = {
+            "MODE_LIVE": E.MODE_LIVE,
+            "REQUIRE_NATIVE_PROTECTION_LIVE": E.REQUIRE_NATIVE_PROTECTION_LIVE,
+            "NP": E._NATIVE_PROTECTION,
+            "NPE": E._NATIVE_PROTECTION_ERROR,
+            "WARNED": E._protection_required_warned,
+            "BLOCKERS": list(E.MEMORY.get("execution_blockers", [])),
+            "DOTENV_PATH": cl._DOTENV_PATH,
+            "ENV_LOADED": cl._ENV_LOADED,
+            "DOTENV_SOURCE": cl._DOTENV_SOURCE,
+        }
+        E.MODE_LIVE = True
+        E.REQUIRE_NATIVE_PROTECTION_LIVE = True
+        E._NATIVE_PROTECTION = None
+        E._NATIVE_PROTECTION_ERROR = None
+        E._protection_required_warned = False
+        E.NativeProtectionManager = _portfolio_np.NativeProtectionManager
+
+    def tearDown(self):
+        for k, v in self._env_saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        E.MODE_LIVE = self._saved["MODE_LIVE"]
+        E.REQUIRE_NATIVE_PROTECTION_LIVE = self._saved["REQUIRE_NATIVE_PROTECTION_LIVE"]
+        E._NATIVE_PROTECTION = self._saved["NP"]
+        E._NATIVE_PROTECTION_ERROR = self._saved["NPE"]
+        E._protection_required_warned = self._saved["WARNED"]
+        blockers = E.MEMORY.setdefault("execution_blockers", [])
+        del blockers[:]
+        blockers.extend(self._saved["BLOCKERS"])
+        cl._DOTENV_PATH = self._saved["DOTENV_PATH"]
+        cl._ENV_LOADED = self._saved["ENV_LOADED"]
+        cl._DOTENV_SOURCE = self._saved["DOTENV_SOURCE"]
+
+    @staticmethod
+    def _write_faux_env(body):
+        tmp = Path(tempfile.mkdtemp(prefix="bootstrap_cfg_")) / ".env"
+        tmp.write_text(body, encoding="utf-8")
+        return tmp
+
+    def test_exact_production_failure_repro_repaired_empty_env_plus_dotenv_one(self):
+        # Production symptom: EMPTY inherited var eclipses the real .env value.
+        os.environ["ENABLE_NATIVE_PROTECTION"] = ""
+        cl._DOTENV_PATH = self._write_faux_env(
+            "ENABLE_NATIVE_PROTECTION=1\n"
+            "REQUIRE_NATIVE_PROTECTION_LIVE=1\n")
+        cl._ENV_LOADED = False
+        cl._DOTENV_SOURCE = None
+        # Real loader, real merge rule (empty shadow repaired).
+        self.assertTrue(cl.ensure_env_loaded())
+        # The resulting runtime configuration must be 1, state SET.
+        self.assertEqual(os.environ.get("ENABLE_NATIVE_PROTECTION"), "1")
+        self.assertEqual(cl.env_state("ENABLE_NATIVE_PROTECTION"), "SET")
+        self.assertTrue(cl.protection_config_status()["effective_enabled"])
+        # Real engine hydrate through the actual gate path -> real manager.
+        self.assertTrue(E._native_protection_gate_ok("FIL/USDT:USDT", "BUY", 70.0, 25.0))
+        self.assertIsNotNone(E._NATIVE_PROTECTION)
+        self.assertTrue(E._NATIVE_PROTECTION.enabled)
+        self.assertIsInstance(E._NATIVE_PROTECTION, _portfolio_np.NativeProtectionManager)
+        self.assertEqual(
+            E.DASHBOARD_STATE.get("native_protection", {}).get("status"), "ENABLED")
+
+    def test_exact_production_failure_still_fails_closed_when_dotenv_is_zero(self):
+        # Same empty-shadow repro, but the real .env value is 0 -> gate must
+        # STILL block: the loader only repairs the shadow, never invents safety.
+        os.environ["ENABLE_NATIVE_PROTECTION"] = ""
+        cl._DOTENV_PATH = self._write_faux_env("ENABLE_NATIVE_PROTECTION=0\n")
+        cl._ENV_LOADED = False
+        cl._DOTENV_SOURCE = None
+        self.assertTrue(cl.ensure_env_loaded())
+        self.assertEqual(os.environ.get("ENABLE_NATIVE_PROTECTION"), "0")
+        self.assertFalse(E._native_protection_gate_ok("ETH/USDT:USDT", "BUY", 72.0, 26.0))
+        self.assertIsNone(E._NATIVE_PROTECTION)
+        self.assertEqual(
+            E.DASHBOARD_STATE.get("native_protection", {}).get("status"), "DISABLED")
+
+    def test_nonempty_shell_override_still_wins_over_dotenv(self):
+        # Explicit non-empty override must keep precedence (never clobbered).
+        os.environ["ENABLE_NATIVE_PROTECTION"] = "0"
+        cl._DOTENV_PATH = self._write_faux_env("ENABLE_NATIVE_PROTECTION=1\n")
+        cl._ENV_LOADED = False
+        cl._DOTENV_SOURCE = None
+        self.assertTrue(cl.ensure_env_loaded())
+        self.assertEqual(os.environ.get("ENABLE_NATIVE_PROTECTION"), "0")
+        self.assertFalse(E._native_protection_gate_ok("ETH/USDT:USDT", "BUY", 72.0, 26.0))
+
+    def test_missing_dotenv_invents_nothing_and_fails_closed(self):
+        # .env absent: loader must NOT invent a value; gate stays fail-closed.
+        cl._DOTENV_PATH = Path(tempfile.mkdtemp(prefix="no_dotenv_")) / ".env"
+        cl._ENV_LOADED = False
+        cl._DOTENV_SOURCE = None
+        os.environ.pop("ENABLE_NATIVE_PROTECTION", None)
+        self.assertFalse(cl.ensure_env_loaded())
+        self.assertIsNone(os.environ.get("ENABLE_NATIVE_PROTECTION"))
+        self.assertEqual(cl.env_state("ENABLE_NATIVE_PROTECTION"), "MISSING")
+        self.assertFalse(E._native_protection_gate_ok("ETH/USDT:USDT", "BUY", 72.0, 26.0))
+        self.assertIsNone(E._NATIVE_PROTECTION)
+
+    def test_malformed_dotenv_value_never_enables_fail_closed(self):
+        # Case E: an unparseable .env value must NOT enable protection and must
+        # surface a diagnostic that explains the fail-closed verdict.
+        os.environ.pop("ENABLE_NATIVE_PROTECTION", None)
+        cl._DOTENV_PATH = self._write_faux_env("ENABLE_NATIVE_PROTECTION=definitely-not-1\n")
+        cl._ENV_LOADED = False
+        cl._DOTENV_SOURCE = None
+        self.assertTrue(cl.ensure_env_loaded())
+        self.assertEqual(cl.env_state("ENABLE_NATIVE_PROTECTION"), "SET")
+        self.assertFalse(cl.protection_config_status()["effective_enabled"])
+        self.assertFalse(E._native_protection_gate_ok("ETH/USDT:USDT", "BUY", 72.0, 26.0))
+        self.assertIsNone(E._NATIVE_PROTECTION)
+        diag = E.DASHBOARD_STATE.get("native_protection", {})
+        self.assertEqual(diag.get("status"), "DISABLED")
+        self.assertEqual(diag.get("live_entry"), "BLOCKED")
+        self.assertIn("ENABLE_NATIVE_PROTECTION must be enabled",
+                      E.MEMORY["execution_blockers"][-1]["reason"])
+
+    def test_dotenv_value_is_idempotent_across_engine_and_bootstrap_calls(self):
+        # Both bootstrap.ensure_env_loaded() and engine's config section call
+        # the SAME loader; a second call must not clobber the merged value.
+        os.environ["ENABLE_NATIVE_PROTECTION"] = ""
+        cl._DOTENV_PATH = self._write_faux_env("ENABLE_NATIVE_PROTECTION=1\n")
+        cl._ENV_LOADED = False
+        cl._DOTENV_SOURCE = None
+        self.assertTrue(cl.ensure_env_loaded())   # bootstrap-style startup call
+        self.assertTrue(cl.ensure_env_loaded())   # engine config-section call
+        self.assertEqual(os.environ.get("ENABLE_NATIVE_PROTECTION"), "1")
+        self.assertTrue(E._native_protection_gate_ok("LAB/USDT:USDT", "BUY", 70.0, 25.0))
 
 
 if __name__ == "__main__":

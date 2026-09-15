@@ -360,14 +360,28 @@ OPEN_FAILURE_CATEGORY_ORDER = (
 )
 
 
-def _classify_open_failure(symbol, side: str, exec_pipe: dict) -> None:
+def _classify_open_failure(symbol, side: str, exec_pipe: dict,
+                           explicit_token=None, explicit_blocker=None) -> None:
     """Bucket a PORTFOLIO.open_candidate failure into a precise category using
-    the breadcrumbs the path itself left (portfolio manager _can_open_blocker,
-    engine _record_exec_blocker -> last_open_outcome, EXECUTION_ERROR). Pure
-    accounting; never raises; never re-decides the entry."""
+    the breadcrumbs the path itself left (allocator reason, portfolio manager
+    _can_open_blocker, engine _record_exec_blocker -> last_open_outcome,
+    EXECUTION_ERROR). Pure accounting; never raises; never re-decides the entry.
+
+    `explicit_token` / `explicit_blocker` let non-portfolio gates (e.g. the
+    allocator-reject branch) classify with the allocator's OWN reason token and
+    the user-facing label, so a capacity reject like INDEX_STOCK_CAP is never
+    shelved as category=other / blocker=NONE. A lifecycle primary_blocker of
+    "NONE" is treated as MISSING (it just means "READY-approved"), so the real
+    blocker recorded by execute_entry (OPEN_REJECTED / last_exec_blocker)
+    wins instead of the 80-event "other" trap.
+    """
     try:
         lc = MEMORY.setdefault("opportunity_lifecycle", {}).get(symbol, {})
-        token = str(lc.get("primary_blocker") or "")
+        if explicit_token is not None:
+            token = str(explicit_token)
+        else:
+            _raw = str(lc.get("primary_blocker") or "")
+            token = "" if _raw.upper() in ("", "NONE") else _raw
         if not token:
             _st = STATE if isinstance(STATE, dict) else {}
             _out = str(_st.get("last_open_outcome") or "")
@@ -385,15 +399,47 @@ def _classify_open_failure(symbol, side: str, exec_pipe: dict) -> None:
             if _frag in upper:
                 category = _cat
                 break
+        blocker = str(explicit_blocker if explicit_blocker is not None else token)
         key = f"open_failure_category:{category}"
         exec_pipe[key] = exec_pipe.get(key, 0) + 1
         exec_pipe["last_open_failure_category"] = category
-        exec_pipe["last_open_failure_blocker"] = token
+        exec_pipe["last_open_failure_blocker"] = blocker
     except Exception:
         try:
             exec_pipe["open_failure_category:unknown"] = exec_pipe.get("open_failure_category:unknown", 0) + 1
         except Exception:
             pass
+
+
+def _record_open_attempt(exec_pipe: dict, *, symbol="", asset_class="", bucket="",
+                         lifecycle_state="READY", portfolio_capacity_result="",
+                         rejection_reason="", rejection_category="",
+                         next_queue_action="") -> None:
+    """Deterministic per-OPEN_REQUESTED-attempt telemetry ring (bounded).
+
+    Every READY candidate offered to the allocation/execution path appends one
+    structured record so the dashboard can show, per symbol, exactly where it
+    died and what the queue did next — instead of only aggregate counters.
+    Never raises; pure accounting.
+    """
+    try:
+        _attempts = exec_pipe.setdefault("open_attempts", [])
+        _attempts.append({
+            "symbol": str(symbol or ""),
+            "asset_class": str(asset_class or ""),
+            "bucket": str(bucket or ""),
+            "lifecycle_state": str(lifecycle_state or "READY"),
+            "portfolio_capacity_result": str(portfolio_capacity_result or ""),
+            "rejection_reason": str(rejection_reason or ""),
+            "rejection_category": str(rejection_category or ""),
+            "next_queue_action": str(next_queue_action or ""),
+            "ts": time.time(),
+        })
+        if len(_attempts) > 200:
+            del _attempts[:-200]
+        exec_pipe["last_open_attempt"] = _attempts[-1]
+    except Exception:
+        pass
 
 
 def _execute_ready_queue_candidate():
@@ -450,6 +496,23 @@ def _execute_ready_queue_candidate():
         _exec_gate("no_slots")
         exec_pipe["last_reject_reason"] = "SLOT_CAP"
         exec_pipe["last_reject_reason_user"] = "TOTAL_PORTFOLIO_CAPACITY_FULL"
+        # Total-portfolio capacity refusals must ALSO enter the failure
+        # taxonomy (category=capacity, blocker=TOTAL_PORTFOLIO_CAPACITY_FULL)
+        # instead of leaving last_open_failure_category stale.
+        _classify_open_failure("", "", exec_pipe,
+                               explicit_token="SLOT_CAP",
+                               explicit_blocker="TOTAL_PORTFOLIO_CAPACITY_FULL")
+        _record_open_attempt(
+            exec_pipe,
+            symbol="",
+            asset_class="",
+            bucket="TOTAL",
+            lifecycle_state="READY",
+            portfolio_capacity_result="SLOT_CAP (TOTAL_PORTFOLIO_CAPACITY_FULL)",
+            rejection_reason="SLOT_CAP",
+            rejection_category="capacity",
+            next_queue_action="no_slot_wait",
+        )
         return False
 
     try:
@@ -541,6 +604,29 @@ def _execute_ready_queue_candidate():
                     MEMORY["portfolio_allocation"] = alloc_report.to_dict()
                     _exec_gate("allocator_reject")
                     _reason_user = PORTFOLIO_REASON_USER.get(decision.reason, decision.reason)
+                    # FAILURE CLASSIFICATION: the allocator-reject branch must
+                    # flow through the SAME taxonomy so INDEX_STOCK_CAP ->
+                    # category=capacity, blocker=INDEX_STOCK_CAPACITY_FULL
+                    # (never "other"/NONE). This is what makes allocator_reject
+                    # count reconcile with open_failure_category:capacity and
+                    # last_open_failure_* instead of leaving stale values.
+                    _classify_open_failure(candidate["symbol"], candidate["side"], exec_pipe,
+                                           explicit_token=decision.reason,
+                                           explicit_blocker=_reason_user)
+                    # QUEUE ADVANCE: capacity-rejected candidates are backed
+                    # off (not re-picked as the highest-READY forever) so the
+                    # next eligible candidate — a free CRYPTO/OIL/GOLD/NEWS seat
+                    # — is evaluated on the following cycle. The allocator
+                    # reason is preserved for the operator.
+                    try:
+                        _bsoff = float(os.getenv("QUEUE_ALLOCATOR_BACKOFF_SEC", "300"))
+                        _best_cand = queue._candidates.get(candidate["symbol"])
+                        if _best_cand is not None:
+                            _best_cand.allocator_rejected_until = time.time() + _bsoff
+                            _best_cand.last_allocator_reason = decision.reason
+                            _best_cand.last_allocator_reason_user = _reason_user
+                    except Exception:
+                        pass
                     exec_pipe["last_reject_reason"] = decision.reason
                     exec_pipe["last_reject_reason_user"] = _reason_user
                     # Full capacity trace: symbol / class / bucket used+max /
@@ -563,6 +649,18 @@ def _execute_ready_queue_candidate():
                         "INFO",
                         debounce_key=f"alloc_reject_{candidate['symbol']}",
                         debounce_sec=60,
+                    )
+                    _record_open_attempt(
+                        exec_pipe,
+                        symbol=candidate["symbol"],
+                        asset_class=decision.asset_class,
+                        bucket=decision.bucket,
+                        lifecycle_state=getattr(best, "state", None).value if getattr(best, "state", None) is not None else "READY",
+                        portfolio_capacity_result=f"{decision.reason} ({_reason_user}) "
+                                                  f"bucket={decision.bucket} {decision.bucket_used}/{decision.bucket_max}",
+                        rejection_reason=decision.reason,
+                        rejection_category=exec_pipe.get("last_open_failure_category", "other"),
+                        next_queue_action="backoff+advance_queue",
                     )
                     return False
                 break
@@ -598,9 +696,31 @@ def _execute_ready_queue_candidate():
                 f"priority={best.priority_score:.1f}",
                 "SUCCESS",
             )
+            _record_open_attempt(
+                exec_pipe,
+                symbol=best.symbol,
+                asset_class=best.asset_class,
+                bucket="",
+                lifecycle_state="EXECUTED",
+                portfolio_capacity_result="ALLOWED (executed)",
+                rejection_reason="",
+                rejection_category="",
+                next_queue_action="position_open",
+            )
             return True
         _exec_gate("open_candidate_failed")
         _classify_open_failure(best.symbol, best.side, exec_pipe)
+        _record_open_attempt(
+            exec_pipe,
+            symbol=best.symbol,
+            asset_class=getattr(best, "asset_class", ""),
+            bucket="",
+            lifecycle_state=getattr(best, "state", None).value if getattr(best, "state", None) is not None else "READY",
+            portfolio_capacity_result="PORTFOLIO/open_candidate rejected",
+            rejection_reason=exec_pipe.get("last_open_failure_blocker", "UNKNOWN"),
+            rejection_category=exec_pipe.get("last_open_failure_category", "other"),
+            next_queue_action="retry_next_cycle",
+        )
     except Exception as exc:
         log_execution(f"[QUEUE] ready execution error: {exc}", "ERROR")
         # A swallowed exception here used to leave the candidate READY and emit

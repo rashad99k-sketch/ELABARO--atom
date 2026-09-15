@@ -376,6 +376,53 @@ class AllocatorReadyExecutionFixTest(unittest.TestCase):
         self.assertEqual(exec_pipe.get("last_reject_technical_max"), 5)
         self.assertNotIn("OIL/USDT:USDT", RT.PORTFOLIO.symbols())
 
+    # ---- 4. Classifier: allocator capacity reject -> category=capacity ----
+    def test_allocator_reject_classified_capacity_not_other(self):
+        RT = self.RT
+        for sym in ["BTC/USDT:USDT", "ETH/USDT:USDT",
+                    "NCSKAAPL2USD/USDT:USDT", "US500/USDT:USDT"]:
+            self._ready_candidate(sym)
+            self.assertTrue(RT._execute_ready_queue_candidate())
+        self.assertEqual(RT.PORTFOLIO.count(), 4)
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+        # Third Index/Stock candidate (USTECH) -> combined bucket full.
+        self._ready_candidate("USTECH/USDT:USDT")
+        self.assertFalse(RT._execute_ready_queue_candidate(),
+                         "Index/Stock #3 must be rejected")
+        exec_pipe = self._exec_pipe()
+        self.assertEqual(exec_pipe.get("last_reject_reason"), "INDEX_STOCK_CAP")
+        # Requirement: INDEX_STOCK_CAP MUST classify as capacity with the user
+        # facing blocker, never other/NONE (the pre-fix behaviour).
+        self.assertEqual(exec_pipe.get("last_open_failure_category"), "capacity")
+        self.assertEqual(exec_pipe.get("last_open_failure_blocker"),
+                         "INDEX_STOCK_CAPACITY_FULL")
+        self.assertGreaterEqual(exec_pipe.get("open_failure_category:capacity", 0), 1)
+        # skip the old other/NONE buckets
+        self.assertNotEqual(exec_pipe.get("last_open_failure_blocker"), "NONE")
+
+        # The rejected candidate is backed off (queue advance), so the queue no
+        # longer re-picks the same blocked highest-READY candidate forever.
+        cand = RT.queue._candidates.get("USTECH/USDT:USDT")
+        self.assertIsNotNone(cand)
+        self.assertGreater(cand.allocator_rejected_until, time.time())
+        self.assertEqual(cand.last_allocator_reason, "INDEX_STOCK_CAP")
+
+        # Per-attempt deterministic telemetry ring carries the failure fact.
+        last_attempt = exec_pipe.get("last_open_attempt")
+        self.assertIsNotNone(last_attempt)
+        self.assertEqual(last_attempt["symbol"], "USTECH/USDT:USDT")
+        self.assertEqual(last_attempt["asset_class"], "INDEX")
+        self.assertEqual(last_attempt["bucket"], "INDEX_STOCK")
+        self.assertEqual(last_attempt["rejection_reason"], "INDEX_STOCK_CAP")
+        self.assertEqual(last_attempt["rejection_category"], "capacity")
+        self.assertEqual(last_attempt["next_queue_action"], "backoff+advance_queue")
+        attempts = exec_pipe.get("open_attempts")
+        self.assertGreaterEqual(len(attempts), 1)
+
+        # Queue advances WITHOUT manual invalidation: the commodity seat is
+        # still free -> GOLD opens after the rejected Index/Stock candidate,
+        # proving a blocked STOCK no longer starves CRYPTO/OIL/GOLD/NEWS.
+        self._ready_candidate("XAUUSD")
+        self.assertTrue(RT._execute_ready_queue_candidate(),
+                        "GOLD must open after backoff; queue must advance")
+        self.assertEqual(RT.PORTFOLIO.count(), 5)

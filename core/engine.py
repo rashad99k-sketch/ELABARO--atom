@@ -13663,6 +13663,9 @@ class ExecutionCandidate:
     confirmation_2_time: float = 0.0
     ready_time: float = 0.0
     allocator_time: float = 0.0
+    allocator_rejected_until: float = 0.0
+    last_allocator_reason: str = ""
+    last_allocator_reason_user: str = ""
     execution_time: float = 0.0
     opened_time: float = 0.0
     original_score: float = 0.0
@@ -16828,7 +16831,10 @@ class ExecutionQueue:
 
     def get_best_candidate(self) -> Optional[ExecutionCandidate]:
         with self._lock:
-            ready = [c for c in self._candidates.values() if c.state == ExecutionState.READY]
+            now_ts = time.time()
+            ready = [c for c in self._candidates.values()
+                     if c.state == ExecutionState.READY
+                     and getattr(c, "allocator_rejected_until", 0.0) <= now_ts]
             if ready:
                 return max(ready, key=lambda c: c.priority_score)
             # Fallback: when no candidate is READY (e.g. the confirmation gate
@@ -16846,6 +16852,7 @@ class ExecutionQueue:
                                    ExecutionState.RETURNED_WATCHLIST)
                 and getattr(getattr(c, "zone_metrics", None), "trigger_state", None)
                 in ("MSS_CONFIRMED", "LIQUIDITY_SWEEP", "BOS_CONFIRMED", "CHOCH_CONFIRMED")
+                and getattr(c, "allocator_rejected_until", 0.0) <= now_ts
             ]
             if not eligible:
                 return None
