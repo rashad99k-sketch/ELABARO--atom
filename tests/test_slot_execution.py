@@ -262,11 +262,13 @@ class SixMarketSlotExecutionTest(unittest.TestCase):
         try:
             self.assertEqual(PortfolioManager._class_cap("CRYPTO"), 2)
             self.assertEqual(PortfolioManager._class_cap("INDEX"), 2)
+            # STOCK belongs to the COMBINED INDEX/STOCK bucket (2 seats),
+            # sharing the INDEX capacity — not a separate cap-0 "no slot".
+            self.assertEqual(PortfolioManager._class_cap("STOCK"), 2)
             self.assertEqual(PortfolioManager._class_cap("GOLD"), 1)
             self.assertEqual(PortfolioManager._class_cap("OIL"), 1)
             self.assertEqual(PortfolioManager._class_cap("NEWS"), 1)
-            self.assertEqual(PortfolioManager._class_cap("STOCK"), 0)
-            self.assertFalse(self.pm.can_open("NCSKNVDA2USD/USDT:USDT", "STOCK"))
+            self.assertTrue(self.pm.can_open("NCSKNVDA2USD/USDT:USDT", "STOCK"))
         finally:
             if saved_env is not None:
                 os.environ["MAX_POSITIONS_PER_ASSET_CLASS"] = saved_env

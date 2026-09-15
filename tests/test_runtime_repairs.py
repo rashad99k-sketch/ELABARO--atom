@@ -1175,9 +1175,15 @@ class CrossAssetDiscoveryTest(unittest.TestCase):
         ]
         r = a.allocate(cands, limit=6)
         allowed = {d.asset_class for d in r.decisions if d.allowed}
-        self.assertEqual({"CRYPTO", "INDEX", "GOLD", "OIL"}, {"CRYPTO", "INDEX", "GOLD", "OIL"} & allowed)
-        # STOCK has no slot in the 6-market model (CRYPTO x2 / INDEX x2 / GOLD x1 / OIL x1 + NEWS).
-        self.assertNotIn("STOCK", allowed)
+        # STOCK now owns a seat in the COMBINED INDEX/STOCK bucket (regression:
+        # it used to be hard-rejected as STOCK_CAP even with the bucket empty).
+        self.assertTrue({"CRYPTO", "INDEX", "GOLD", "STOCK"} <= allowed)
+        # OIL and GOLD share ONE commodity seat: the higher-priority one (GOLD
+        # 95) wins and the OIL candidate must be refused with the precise
+        # combined-bucket reason.
+        by = {d.asset_class: d for d in r.decisions}
+        self.assertFalse(by["OIL"].allowed)
+        self.assertEqual(by["OIL"].reason, "COMMODITY_CAP")
 
 
 class TradFiStockDiscoveryTest(unittest.TestCase):
@@ -1256,16 +1262,31 @@ class TradFiStockDiscoveryTest(unittest.TestCase):
         self.assertEqual(market_status({"info": {}})["market_status"], "UNKNOWN")
         self.assertEqual(market_status({"info": {}})["source"], "FALLBACK")
 
-    # H. Allocator compatibility: STOCK candidate has NO slot in the 6-market model
-    def test_allocator_rejects_stock_outside_six_market_model(self):
+    # H. Allocator combined INDEX/STOCK bucket: STOCK owns a seat and the third
+    # Index/Stock position is refused with the precise reason + capacity trace.
+    def test_allocator_stock_shares_combined_index_stock_bucket(self):
         from portfolio.manager import PortfolioManager
         from portfolio.allocator import GlobalAssetAllocator
         m = PortfolioManager(6, None)
         a = GlobalAssetAllocator(m, E)
-        r = a.allocate([{"symbol": "NCSKAAPL2USD/USDT:USDT", "asset_class": "STOCK",
-                         "side": "BUY", "priority_score": 70.0}], limit=6)
-        self.assertFalse(r.decisions[0].allowed)
-        self.assertEqual(r.decisions[0].reason, "STOCK_CAP")
+        r = a.allocate([
+            {"symbol": "NVDA", "asset_class": "STOCK", "side": "BUY", "priority_score": 70.0},
+            {"symbol": "AAPL", "asset_class": "STOCK", "side": "BUY", "priority_score": 69.0},
+            {"symbol": "US500/USDT:USDT", "asset_class": "INDEX", "side": "BUY", "priority_score": 68.0},
+            {"symbol": "BTC/USDT:USDT", "asset_class": "CRYPTO", "side": "BUY", "priority_score": 90.0},
+        ], limit=6)
+        by = {d.symbol: d for d in r.decisions}
+        self.assertTrue(by["BTC/USDT:USDT"].allowed)
+        # First STOCK opens (regression: it used to be always-rejected STOCK_CAP).
+        self.assertTrue(by["NVDA"].allowed)
+        # Second Stock/Index fills the combined 2-seat bucket.
+        self.assertTrue(by["AAPL"].allowed)
+        # Third Index/Stock -> combined bucket full with the precise reason.
+        self.assertFalse(by["US500/USDT:USDT"].allowed)
+        self.assertEqual(by["US500/USDT:USDT"].reason, "INDEX_STOCK_CAP")
+        self.assertEqual(by["US500/USDT:USDT"].bucket, "INDEX_STOCK")
+        self.assertEqual(by["US500/USDT:USDT"].bucket_used, 2)
+        self.assertEqual(by["US500/USDT:USDT"].bucket_max, 2)
 
 
 class QueuePromotionsPayloadTest(unittest.TestCase):

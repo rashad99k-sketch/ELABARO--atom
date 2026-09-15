@@ -73,6 +73,7 @@ import math
 import gc
 import random
 import hashlib
+import re
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Tuple, Optional, Any
 from enum import Enum
@@ -571,6 +572,13 @@ def tg_error(err_msg, error_type="EXECUTION"):
     send_once(f"🚨 <b>ERROR</b> [{error_type}]\n{err_msg[:200]}", f"err_{error_type}_{err_msg[:50]}", 60)
 
 # ========== CONFIGURATION ==========
+# Fail-safe .env loading BEFORE any os.getenv() read below. Fixes (1) CWD-
+# dependent .env lookup on Windows service/batch startup and (2) empty-value
+# shadowing where a blank machine/user env var eclipses a real .env value such
+# as ENABLE_NATIVE_PROTECTION=1. Idempotent; see core/config_loader.py.
+import core.config_loader as _config_loader
+_config_loader.ensure_env_loaded()
+
 API_KEY = os.getenv("BINGX_API_KEY", "")
 API_SECRET = os.getenv("BINGX_API_SECRET", "")
 PAPER_MODE = os.getenv("PAPER_MODE", "True").strip().lower() in {"1", "true", "yes", "on"}
@@ -3659,19 +3667,41 @@ def _set_protection_status(status, order_id=None, reason=None):
     payload = {"status": STATE["protection_status"], "order_id": order_id}
     if reason: payload["reason"] = str(reason)
     DASHBOARD_STATE["protection"] = payload
+    try:
+        if str(status).upper() == "PROTECTED":
+            _native_protection_diagnostics(blocked=False)
+    except Exception:
+        pass
     return payload
 
 def _ensure_native_protection(symbol):
-    global _NATIVE_PROTECTION
+    global _NATIVE_PROTECTION, _NATIVE_PROTECTION_ERROR
     if PAPER_MODE or NativeProtectionManager is None:
         return _set_protection_status("PAPER_SYNTHETIC")
     if _NATIVE_PROTECTION is None:
-        _NATIVE_PROTECTION = NativeProtectionManager(ex, log_execution)
-    result = _NATIVE_PROTECTION.place(
-        symbol, STATE.get("side"), STATE.get("remaining_qty", STATE.get("qty", 0.0)),
-        STATE.get("synthetic_sl", STATE.get("sl", 0.0)),
-        _hedge_position_side(STATE.get("side")),
-    )
+        if not _config_loader.protection_config_status()["effective_enabled"]:
+            log_execution(
+                f"[LIVE_SAFETY] {symbol} protection manager not hydrated: "
+                f"ENABLE_NATIVE_PROTECTION is not enabled", "ERROR")
+            return _set_protection_status("UNPROTECTED", reason="PROTECTION_NOT_ENABLED")
+        try:
+            _NATIVE_PROTECTION = NativeProtectionManager(ex, log_execution)
+            _NATIVE_PROTECTION_ERROR = None
+        except Exception as exc:
+            _NATIVE_PROTECTION_ERROR = f"INIT_FAILED: {_sanitize_reason(exc)}"
+            _set_protection_status("ERROR", reason=_NATIVE_PROTECTION_ERROR)
+            _native_protection_diagnostics(blocked=True)
+            return {"status": "ERROR", "reason": _NATIVE_PROTECTION_ERROR}
+    try:
+        result = _NATIVE_PROTECTION.place(
+            symbol, STATE.get("side"), STATE.get("remaining_qty", STATE.get("qty", 0.0)),
+            STATE.get("synthetic_sl", STATE.get("sl", 0.0)),
+            _hedge_position_side(STATE.get("side")),
+        )
+    except Exception as exc:
+        _set_protection_status("UNPROTECTED",
+                               reason=f"INIT_FAILED: {_sanitize_reason(exc)}")
+        return {"status": "UNPROTECTED", "reason": _sanitize_reason(exc)}
     return _set_protection_status(result.get("status", "UNPROTECTED"), result.get("sl_order_id"), result.get("reason"))
 
 _protection_required_warned = False
@@ -3682,22 +3712,39 @@ def _hydrate_native_protection():
     The LIVE gate must not self-block a correctly-configured first entry
     simply because the manager is still None; actual SL placement stays
     post-fill (start_trade -> _ensure_native_protection). Fail-closed
-    behaviour is unchanged when the mechanism is not configured."""
-    global _NATIVE_PROTECTION
+    behaviour is unchanged when the mechanism is not configured. A
+    construction failure is captured (never silently collapsed to MISSING)
+    and keeps the gate blocking with an ERROR status."""
+    global _NATIVE_PROTECTION, _NATIVE_PROTECTION_ERROR
     if _NATIVE_PROTECTION is None and NativeProtectionManager is not None:
-        if os.getenv("ENABLE_NATIVE_PROTECTION", "0").strip().lower() in {"1", "true", "yes", "on"}:
-            _NATIVE_PROTECTION = NativeProtectionManager(ex, log_execution)
+        if _config_loader.protection_config_status()["effective_enabled"]:
+            try:
+                _NATIVE_PROTECTION = NativeProtectionManager(ex, log_execution)
+                _NATIVE_PROTECTION_ERROR = None
+            except Exception as exc:
+                _NATIVE_PROTECTION_ERROR = f"INIT_FAILED: {_sanitize_reason(exc)}"
+                _set_protection_status("ERROR", reason=_NATIVE_PROTECTION_ERROR)
+                log_execution(f"[LIVE_SAFETY] protection manager init FAILED: {_NATIVE_PROTECTION_ERROR}", "ERROR")
+    return _NATIVE_PROTECTION
 
 def _native_protection_gate_ok(symbol, side, score, adx_val):
     """Fail-closed gate: live entries require exchange-native SL protection."""
     if not (MODE_LIVE and REQUIRE_NATIVE_PROTECTION_LIVE):
+        _native_protection_diagnostics(blocked=False)
         return True
     _hydrate_native_protection()
-    if _NATIVE_PROTECTION is None or not getattr(_NATIVE_PROTECTION, "enabled", False):
+    _np_exists = _NATIVE_PROTECTION is not None
+    _np_enabled = getattr(_NATIVE_PROTECTION, "enabled", False) if _np_exists else False
+    if _NATIVE_PROTECTION is None or not _np_enabled:
         global _protection_required_warned
-        _np_exists = _NATIVE_PROTECTION is not None
-        _np_enabled = getattr(_NATIVE_PROTECTION, "enabled", False) if _np_exists else False
-        _env_val = os.getenv("ENABLE_NATIVE_PROTECTION", "<unset>").strip().strip('"').strip("'")
+        _enable_state = _config_loader.env_state("ENABLE_NATIVE_PROTECTION")
+        if not _np_exists and _NATIVE_PROTECTION_ERROR:
+            _manager_state = _sanitize_reason(_NATIVE_PROTECTION_ERROR)
+        elif not _np_exists:
+            _manager_state = "MISSING (not initialized; config ENABLE_NATIVE_PROTECTION=%s)" % _enable_state
+        else:
+            _manager_state = "INITIALIZED but DISABLED"
+        _env_val = os.getenv("ENABLE_NATIVE_PROTECTION", "")
         log_execution(
             f"[LIVE_SAFETY] {symbol} blocked: exchange-native protection is required for LIVE entries"
             f" (manager={'exists' if _np_exists else 'MISSING'}, enabled={_np_enabled},"
@@ -3705,8 +3752,13 @@ def _native_protection_gate_ok(symbol, side, score, adx_val):
         if not _protection_required_warned:
             _protection_required_warned = True
             log_execution(f"[LIVE_SAFETY] {symbol}: set ENABLE_NATIVE_PROTECTION=1 (plus NATIVE_PROTECTION_ORDER_TYPE/NATIVE_PROTECTION_PARAMS_JSON as needed) to require the native SL, or REQUIRE_NATIVE_PROTECTION_LIVE=0 to allow the synthetic/paper SL manager", "WARN")
-        _record_exec_blocker(symbol, "PROTECTION_REQUIRED", "ENABLE_NATIVE_PROTECTION must be enabled for live entries", side, score, adx=adx_val)
+        _block_reason = (
+            "ENABLE_NATIVE_PROTECTION must be enabled for live entries; "
+            f"config={_enable_state}; manager={_manager_state}")
+        _record_exec_blocker(symbol, "PROTECTION_REQUIRED", _block_reason, side, score, adx=adx_val)
+        _native_protection_diagnostics(blocked=True)
         return False
+    _native_protection_diagnostics(blocked=False)
     return True
 
 def _cancel_native_protection(symbol):
@@ -6743,13 +6795,81 @@ if _DATA_FABRIC is not None and EvidenceBusProvider is not None and _EVIDENCE_BU
     _DATA_FABRIC.register(EvidenceBusProvider(_EVIDENCE_BUS))
 _TRADE_JOURNAL = TradeLifecycleJournal() if TradeLifecycleJournal else None
 
+# Native-protection manager state (fail-closed). _NATIVE_PROTECTION_ERROR keeps
+# the REAL sanitized construction cause instead of silently collapsing init
+# failures into "MISSING" (LIVE safety forensic RC).
+_NATIVE_PROTECTION = None
+_NATIVE_PROTECTION_ERROR = None
+
+def _sanitize_reason(message):
+    """Strip likely credential material from diagnostics/log strings.
+
+    Conservative: redacts the value following credential-like key names and
+    long opaque tokens (BingX order ids are short; API key/secret tokens are
+    long). Never raises; returns a bounded string.
+    """
+    try:
+        text = str(message or "")
+        text = re.sub(
+            r"(?i)(api[_-]?key|api[_-]?secret|secret|token|password|passphrase|authorization)"
+            r"(\s*[=:]\s*|\s+)[^,;\s]{0,96}",
+            r"\1\2<REDACTED>",
+            text,
+        )
+        text = re.sub(r"\b[0-9A-Fa-f]{24,}\b", "<REDACTED>", text)
+        return text[:220]
+    except Exception:
+        return str(message or "")[:220]
+
+def _native_protection_diagnostics(blocked=None):
+    """Sanitized diagnostic block pushed to the dashboard (never secrets).
+
+    Distinguishes ENABLED / DISABLED / MISSING / ERROR / VERIFIED with a safe
+    user-facing reason and a live-entry verdict.
+    """
+    try:
+        cfg = _config_loader.protection_config_status()
+        mgr = _NATIVE_PROTECTION
+        if mgr is not None and _NATIVE_PROTECTION_ERROR:
+            manager_state = "INIT_FAILED"
+        elif mgr is not None:
+            manager_state = "INITIALIZED"
+        else:
+            manager_state = "MISSING"
+        enabled = bool(getattr(mgr, "enabled", False)) if mgr is not None else False
+        last_status = str(STATE.get("protection_status", "")).upper()
+        if mgr is not None and enabled and last_status == "PROTECTED":
+            status = "VERIFIED"
+        elif mgr is not None and enabled:
+            status = "ENABLED"
+        elif _NATIVE_PROTECTION_ERROR:
+            status = "ERROR"
+        elif cfg["effective_enabled"]:
+            status = "ERROR"  # enabled config but no healthy manager
+        else:
+            status = "DISABLED" if cfg["config"]["ENABLE_NATIVE_PROTECTION"] in ("SET", "EMPTY") else "MISSING"
+        _blocked = blocked if blocked is not None else not (mgr is not None and enabled)
+        DASHBOARD_STATE["native_protection"] = {
+            "status": status,
+            "manager": manager_state,
+            "manager_enabled": enabled,
+            "last_sl_status": last_status or "NONE",
+            "live_entry": "BLOCKED" if _blocked else "PROCEED",
+            "require_live_policy": cfg["require_live"],
+            "reason": _sanitize_reason(_NATIVE_PROTECTION_ERROR or STATE.get("protection_status") or ""),
+            "config": cfg["config"],
+            "dotenv_loaded": cfg["dotenv_loaded"],
+        }
+        return DASHBOARD_STATE["native_protection"]
+    except Exception:
+        return {}
+
 def collect_market_evidence(symbol, context=None):
     """Collect normalized provider evidence without changing entry authority."""
     if _DATA_FABRIC is None:
         return {"symbol": symbol, "records": {}, "quality": "UNKNOWN"}
     snap = _DATA_FABRIC.collect(str(symbol), context or {})
     return snap.to_dict()
-_NATIVE_PROTECTION = None
 _SETUP_EDGE = SetupEdgeEngine() if SetupEdgeEngine else None
 
 # ========== DASHBOARD STATE ==========

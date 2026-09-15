@@ -20,6 +20,15 @@ class NativeProtectionManager:
         o=self._orders.get(symbol)
         if o and o.get("sl_order_id"): return "PROTECTED"
         return "UNPROTECTED"
+    def summary(self):
+        """Sanitized manager diagnostic (no credentials, no order ids)."""
+        return {
+            "enabled": bool(self.enabled),
+            "order_type": str(self.order_type),
+            "verify": os.getenv("NATIVE_PROTECTION_VERIFY","1").strip().lower() in {"1","true","yes","on"},
+            "exchange_present": self.exchange is not None,
+            "protected_symbols": sorted(self._orders.keys()),
+        }
     def _params(self, side, position_side, trigger):
         params={"positionSide":position_side,"triggerPrice":float(trigger)}
         raw=os.getenv("NATIVE_PROTECTION_PARAMS_JSON","").strip()

@@ -336,9 +336,14 @@ class AllocatorGatesOnLivePortfolioTest(_PortfolioEngineTestCase):
         self.assertFalse(by["SOL/USDT:USDT"].allowed)
         self.assertEqual(by["SOL/USDT:USDT"].reason, "CRYPTO_CAP")
         self.assertFalse(by["NAS100/USDT:USDT"].allowed)
-        self.assertEqual(by["NAS100/USDT:USDT"].reason, "INDEX_CAP")
+        # INDEX/STOCK share ONE combined 2-seat bucket: US500+USTECH already
+        # occupy it, so the third index/stock candidate reports the precise
+        # combined-bucket reason (INDEX_CAP legacy token is no longer emitted).
+        self.assertEqual(by["NAS100/USDT:USDT"].reason, "INDEX_STOCK_CAP")
+        self.assertEqual(by["NAS100/USDT:USDT"].bucket_used, 2)
         self.assertFalse(by["XAGUSD"].allowed)
-        self.assertEqual(by["XAGUSD"].reason, "TECHNICAL_CAP")
+        # OIL (WTI) already occupies the lone combined OIL/GOLD seat.
+        self.assertEqual(by["XAGUSD"].reason, "COMMODITY_CAP")
         # The independent NEWS slot is already occupied, so additional NEWS
         # candidates are blocked by the singleton NEWS cap.
         self.assertFalse(by["TSLA"].allowed)

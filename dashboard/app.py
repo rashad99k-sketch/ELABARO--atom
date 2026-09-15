@@ -12,6 +12,15 @@ import core.engine as E
 import scanner.scanner as S
 globals().update({k:v for k,v in vars(E).items() if not k.startswith('__')})
 globals().update({k:v for k,v in vars(S).items() if not k.startswith('__')})
+# Re-pin the dependency names AFTER copying engine/scanner globals. core.engine
+# imports Flask at its own import time and caches the class in its globals; the
+# globals().update(vars(E)) above would otherwise copy a STALE Flask class (e.g.
+# one captured under a test-only boundary that lacks test_client) and the `app`
+# below would be built from it. Always bind to the flask module that is actually
+# registered NOW so the dashboard app has the full API surface deterministically.
+Flask = getattr(__import__("flask"), "Flask")
+jsonify = getattr(__import__("flask"), "jsonify")
+request = getattr(__import__("flask"), "request")
 
 
 def _sync_engine_state():
@@ -1473,6 +1482,7 @@ def data_fabric_endpoint():
 def health():
     health_state = MEMORY.get("health", {}) or {}
     queue_state = "HEALTHY" if USE_EXECUTION_QUEUE else "DISABLED"
+    np = DASHBOARD_STATE.get("native_protection", {})
     return jsonify({
         "ok": True,
         "overall_status": health_state.get("status", "RUNNING"),
@@ -1484,6 +1494,12 @@ def health():
         "execution_status": "LIVE" if MODE_LIVE else "PAPER",
         "dashboard_status": "HEALTHY",
         "queue_status": queue_state,
+        "native_protection": {
+            "status": np.get("status", "MISSING"),
+            "manager": np.get("manager", "MISSING"),
+            "live_entry": np.get("live_entry", "UNKNOWN"),
+            "reason": np.get("reason", ""),
+        },
         "errors": int(health_state.get("errors", 0) or 0),
     }), 200
 

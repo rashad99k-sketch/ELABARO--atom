@@ -7,9 +7,12 @@ from __future__ import annotations
 import os
 import threading
 import signal
-from dotenv import load_dotenv
 
-load_dotenv()
+# CWD-independent, empty-shadow-proof .env loading BEFORE any module that reads
+# os.getenv (config_loader merges the repo .env for absent/empty keys only).
+from core.config_loader import ensure_env_loaded, protection_config_status
+
+ensure_env_loaded()
 
 import core.engine as E
 import scanner.scanner as S
@@ -46,6 +49,32 @@ def run() -> None:
     print(f"MAX OPEN POSITIONS: {R.PORTFOLIO.max_positions}")
     print("MARKETS: CRYPTO | STOCKS | INDICES | GOLD | OIL")
     print("NEWS: ENABLED" if os.getenv("NEWS_ENABLED", "true").lower() in {"1", "true", "yes", "on"} else "NEWS: DISABLED")
+    _np_cfg = protection_config_status()
+    if E.MODE_LIVE and E.REQUIRE_NATIVE_PROTECTION_LIVE:
+        _np_enabled = _np_cfg["effective_enabled"]
+        print(
+            "NATIVE PROTECTION: "
+            f"{'REQUIRED + CONF' if _np_enabled else 'REQUIRED + MISSING CONFIG'}"
+            f" | ENABLE_NATIVE_PROTECTION={_np_cfg['config']['ENABLE_NATIVE_PROTECTION']}"
+            f" | REQUIRE_NATIVE_PROTECTION_LIVE=ON"
+            f" | .env loaded={_np_cfg['dotenv_loaded']}"
+        )
+        if not _np_enabled:
+            print("[LIVE_SAFETY] LIVE entries are fail-closed BLOCKED until "
+                  "ENABLE_NATIVE_PROTECTION=1 is effective in .env (and "
+                  "NATIVE_PROTECTION_ORDER_TYPE/NATIVE_PROTECTION_PARAMS_JSON"
+                  " set as needed).")
+        else:
+            try:
+                E._hydrate_native_protection()
+                _mgr = E._NATIVE_PROTECTION
+                print(f"[NATIVE PROTECTION] manager hydrated: {'INITIALIZED' if _mgr is not None else 'MISSING'} "
+                      f"enabled={getattr(_mgr, 'enabled', False) if _mgr is not None else False}")
+            except Exception as _hydrate_exc:
+                print(f"[NATIVE PROTECTION] manager hydrate FAILED (fail-closed): {_hydrate_exc}")
+    else:
+        print("NATIVE PROTECTION: not enforced (PAPER mode or "
+              "REQUIRE_NATIVE_PROTECTION_LIVE=OFF)")
     print("=" * 72)
 
     # Background workers remain daemonized so a hard process exit cannot hang,

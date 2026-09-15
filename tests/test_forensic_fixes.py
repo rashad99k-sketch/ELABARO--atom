@@ -375,15 +375,19 @@ class ForensicFixesTest(unittest.TestCase):
         rival.priority_score = 1.0
         self.assertFalse(q.add_candidate(rival))
 
-    # ---- 15. 6-position portfolio cap intact ----
+    # ---- 15. 6-position portfolio cap intact (5 technical + 1 NEWS) ----
     def test_six_position_cap_intact(self):
         from portfolio.manager import PortfolioManager
         pm = PortfolioManager(6, self.engine)
         self.assertEqual(pm.max_positions, 6)
         self.assertLessEqual(pm.count(), 6)
-        from portfolio.allocator import DEFAULT_CLASS_CAPS
-        self.assertEqual(sum(v for k, v in DEFAULT_CLASS_CAPS.items()
-                             if k != "NEWS"), 6)
+        from portfolio.allocator import DEFAULT_CLASS_CAPS, bucket_cap, bucket_of
+        # Technical budget = CRYPTO(2) + INDEX/STOCK(2) + OIL/GOLD(1) = 5.
+        self.assertEqual(
+            bucket_cap(bucket_of("CRYPTO")) + bucket_cap(bucket_of("STOCK"))
+            + bucket_cap(bucket_of("GOLD")), 5)
+        # Plus the independent NEWS seat -> 6 total.
+        self.assertEqual(DEFAULT_CLASS_CAPS.get("NEWS"), 1)
 
     # ---- 16. NEWS slot admits at most one ----
     def test_news_slot_at_most_one(self):

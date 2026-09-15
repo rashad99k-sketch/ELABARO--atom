@@ -109,14 +109,19 @@ class AllocatorCapacityHardeningTest(unittest.TestCase):
     def test_rejected_candidates_do_not_consume_total_slot(self):
         pm = PortfolioManager(6, None)
         pm.risk_guard.can_open = lambda *a, **k: True
-        pm.contexts = {"C1": _ctx("C1", "CRYPTO")}
+        # GOLD already occupies the lone combined OIL/GOLD seat.
+        pm.contexts = {"C1": _ctx("C1", "CRYPTO"), "G1": _ctx("G1", "GOLD")}
         alloc = GlobalAssetAllocator(pm, None)
         candidates = [
-            {"symbol": "BAD1", "side": "BUY", "asset_class": "STOCK", "priority_score": 100},
+            {"symbol": "BAD1", "side": "BUY", "asset_class": "OIL", "priority_score": 100},
             {"symbol": "GOOD", "side": "BUY", "asset_class": "CRYPTO", "priority_score": 90},
         ]
         report = alloc.allocate(candidates, limit=6)
+        bad = next(d for d in report.decisions if d.symbol == "BAD1")
         good = next(d for d in report.decisions if d.symbol == "GOOD")
+        self.assertFalse(bad.allowed)
+        self.assertEqual(bad.reason, "COMMODITY_CAP")
+        # The rejected candidate consumed nothing: CRYPTO still has a free seat.
         self.assertTrue(good.allowed)
 
 

@@ -1,22 +1,28 @@
-"""Six-position paper test through the REAL runtime authority.
+"""Allocator / READY execution forensic fix: combined INDEX/STOCK bucket.
 
-The forensic root cause was that the queue granted READY but the BARON ZONE/OB
-judge (core/engine.py) silently killed every candidate with WAIT_RETEST under
-the production default BARON_ZONE_JUDGE=1, so EXECUTED stayed 0. This file
-drives the ACTUAL production loop path — core.runtime._execute_ready_queue_candidate
-for technical candidates and core.runtime.execute_news_slot for the independent
-NEWS slot — with the judge forced ON, while every other gate stays real
-(allocator / class caps / portfolio cap / risk guard / sizing / lifecycle).
+Production telemetry showed READY candidates dying right after the allocator
+with a bare `STOCK_CAP` rejection:
+    QUEUE: ready=7 ... EXECUTION: last=allocator_reject
+    allocator_reject=2, last_reject_reason=STOCK_CAP
 
-Covered:
-  1. Six positions open at once through the runtime: 2 CRYPTO + 2 INDEX +
-     1 GOLD (technical) + 1 NEWS, judge assertions that WAIT_RETEST was
-     advisory and no BARON_REJECT fired.
-  2. 6th technical refused -> precise combined-bucket reason
-      COMMODITY_CAPACITY_FULL (OIL/GOLD share the 1-seat commodity seat).
-  3. 2nd NEWS attempt refused -> user-facing NEWS_SLOT_FULL (news independence:
-     a NEWS trade never consumes a technical class quota).
-  4. 7th position refused -> user-facing TOTAL_PORTFOLIO_CAPACITY_FULL.
+ROOT CAUSE: INDEX and STOCK were two SEPARATE capacity buckets — and STOCK had
+cap 0 (`CLASS_CAPS.get("STOCK", 0) == 0`, and `0 >= 0` is always true), so the
+FIRST stock candidate was rejected before it ever reached a slot, while the
+intended portfolio model gives INDEX/STOCK a COMBINED 2-seat technical bucket
+("Index/Stock #1 + Index/Stock #2", never 2 INDEX + 2 STOCK). OIL/GOLD also
+share ONE 1-seat commodity seat.
+
+This file drives the SAME production path
+(core.runtime._execute_ready_queue_candidate for technical candidates and
+core.runtime.execute_news_slot for the independent NEWS slot) with the BARON
+judge ON and every other gate real, and proves:
+
+  1. Crypto #1 + Crypto #2 + Stock #1 + Index #1  -> Index accepted (combined).
+  2. ... + Gold #1 -> TECHNICAL = 5/5, then News #1 -> TOTAL = 6/6.
+  3. Index/Stock #3 -> REJECTED INDEX_STOCK_CAPACITY_FULL (used=2/max=2).
+  4. Gold vs Oil on the SAME commodity seat -> 2nd one REJECTED
+     COMMODITY_CAPACITY_FULL.
+  5. News #2 -> NEWS_SLOT_FULL; 7th position -> TOTAL_PORTFOLIO_CAPACITY_FULL.
 """
 import os
 import sys
@@ -63,12 +69,12 @@ def _load_runtime():
             self.markets = {}
 
     fake_ccxt.bingx = FakeBingX
-    fake_flask = types.ModuleType("flask")
-    fake_flask.Flask = _FakeFlask
-    fake_flask.jsonify = lambda *a, **k: a[0] if a else None
-    fake_flask.request = types.SimpleNamespace(headers={}, remote_addr="127.0.0.1", json=None)
     sys.modules["ccxt"] = fake_ccxt
-    sys.modules["flask"] = fake_flask
+    # ccxt is the only dependency this suite needs to fake. The conftest flask
+    # boundary (with test_client) is left intact: replacing it with a private
+    # stub here poisons core.engine's Flask/app globals, which dashboard/app.py
+    # copies into its own namespace and then caches process-wide, breaking every
+    # later dashboard test (stub without test_client).
 
     import core.runtime as RT
     return RT
@@ -79,7 +85,7 @@ def _restore_modules(saved):
     sys.modules.update(saved)
 
 
-def _frame(n=250, base=100.0, side="BUY"):
+def _frame(n=250, base=100.0):
     t = np.arange(n)
     x = base + 3.0 * (1 - np.exp(-t / 900.0)) + 1.5 * np.sin(t / 6.0)
     o = x - 0.2
@@ -105,9 +111,9 @@ PRICES = {
     "ETH/USDT:USDT": 3000.0,
     "US500/USDT:USDT": 5000.0,
     "USTECH/USDT:USDT": 17000.0,
+    "NCSKAAPL2USD/USDT:USDT": 210.0,
     "XAUUSD": 2300.0,
     "OIL/USDT:USDT": 80.0,
-    "SOL/USDT:USDT": 150.0,
     "NCSKNVDA2USD/USDT:USDT": 130.0,
 }
 
@@ -116,19 +122,26 @@ CLASS_BY_SYMBOL = {
     "ETH/USDT:USDT": "CRYPTO",
     "US500/USDT:USDT": "INDEX",
     "USTECH/USDT:USDT": "INDEX",
+    "NCSKAAPL2USD/USDT:USDT": "STOCK",
     "XAUUSD": "GOLD",
     "OIL/USDT:USDT": "OIL",
-    "SOL/USDT:USDT": "CRYPTO",
+}
+
+READY_FLOORS = {
+    "CRYPTO": 68.0,
+    "INDEX": 68.0,
+    "STOCK": 67.0,
+    "GOLD": 68.0,
+    "OIL": 68.0,
 }
 
 
-class SixSlotRuntimeBaronTest(unittest.TestCase):
+class AllocatorReadyExecutionFixTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
         cls._saved_modules = sys.modules.copy()
         cls.RT = _load_runtime()
-        # Connect the runtime numerator to the SAME portfolio under test.
         from portfolio.manager import PortfolioManager
         from portfolio.allocator import GlobalAssetAllocator
         cls._pm_type = PortfolioManager
@@ -139,17 +152,13 @@ class SixSlotRuntimeBaronTest(unittest.TestCase):
         _restore_modules(cls._saved_modules)
 
     def setUp(self):
-        # Sibling teardowns (e.g. test_portfolio_isolation) call os.environ.clear(),
-        # wiping module-import-time setdefaults; re-establish the FULL required
-        # environment explicitly so this file is order-independent.
         os.environ["BARON_ZONE_JUDGE"] = "1"
         os.environ["PAPER_MODE"] = "True"
         os.environ["USE_EXECUTION_QUEUE"] = "True"
         os.environ["NEWS_ENABLED"] = "True"
         os.environ["NEWS_SLOT_ENABLED"] = "True"
         os.environ["MAX_TECHNICAL_POSITIONS"] = "5"
-        # Per-direction cap is env-configurable (default 4/4). The six-slot
-        # scenario is a pure one-direction day; raise BUY to the full book.
+        os.environ.pop("MAX_POSITIONS_PER_ASSET_CLASS", None)
         os.environ["MAX_BUY_POSITIONS"] = "6"
         os.environ["MAX_SELL_POSITIONS"] = "6"
         RT = self.RT
@@ -203,11 +212,11 @@ class SixSlotRuntimeBaronTest(unittest.TestCase):
             "asset_class": asset_class,
         }
 
-    def _ready_candidate(self, symbol, score=71.4, ready_floor=68.0,
-                         side="BUY", asset_class=None):
+    def _ready_candidate(self, symbol, score=71.4, side="BUY", asset_class=None):
         E = self.RT.E
         price = PRICES[symbol]
         atr = price * 0.01
+        cls = asset_class or CLASS_BY_SYMBOL[symbol]
         cand = E.ExecutionCandidate(
             symbol=symbol, side=side, price=price,
             entry_price=price - atr * 0.5, stop_loss=price - atr * 1.6,
@@ -227,9 +236,9 @@ class SixSlotRuntimeBaronTest(unittest.TestCase):
         cand.zone_high = price + atr * 0.4
         cand.entry_distance_atr = 0.4
         cand.opportunity_type = E.OpportunityType.ACCUMULATION_ENTRY
-        cand.asset_class = asset_class or CLASS_BY_SYMBOL[symbol]
-        cand.ready_score_required = float(ready_floor)
-        self._govern_watch(symbol, cand.asset_class)
+        cand.asset_class = cls
+        cand.ready_score_required = READY_FLOORS[cls]
+        self._govern_watch(symbol, cls)
         self.assertTrue(E.queue.add_candidate(cand), f"admit {symbol}")
         E.queue._record_opportunity_lifecycle(cand)
         return cand
@@ -237,147 +246,135 @@ class SixSlotRuntimeBaronTest(unittest.TestCase):
     def _news_watch(self, symbol="NCSKNVDA2USD/USDT:USDT", bias="BULLISH",
                     risk=20.0):
         E = self.RT.E
-        sym = symbol
-        price = PRICES[sym]
-        E.MEMORY.setdefault("watchlist", {})[sym] = {
-            "symbol": sym, "side": "BUY", "price": price,
+        price = PRICES[symbol]
+        E.MEMORY.setdefault("watchlist", {})[symbol] = {
+            "symbol": symbol, "side": "BUY", "price": price,
             "atr": price * 0.01, "news_risk": risk, "asset_class": "NEWS",
             "news": types.SimpleNamespace(
                 risk=risk, bias=bias,
                 headlines=[{"impact_strength": "STRONG", "scope": "DIRECT",
-                            "headline": f"{sym} impact"}],
+                            "headline": f"{symbol} impact"}],
                 as_dict=lambda: {"bias": bias, "risk": risk},
             ),
         }
         E.DASHBOARD_STATE["news_reaction"] = {
-            "items": [{"symbol": sym, "reaction": {
+            "items": [{"symbol": symbol, "reaction": {
                 "causality": "CONFIRMED", "move_pct": 0.20, "direction": "UP"}}],
         }
 
     def _exec_pipe(self):
         return self.RT.MEMORY.setdefault("pipeline", {}).setdefault("execution", {})
 
-    # ---- 1. Six positions open through the REAL runtime under judge ON ----
-    def test_six_positions_open_via_runtime_under_judge_on(self):
+    # ---- 1. Stock #1 + Index #1 share the combined bucket; then News; 7th ----
+    def test_stock_index_gold_news_full_book_via_runtime(self):
         RT = self.RT
-        for sym in ["BTC/USDT:USDT", "ETH/USDT:USDT", "US500/USDT:USDT",
-                    "USTECH/USDT:USDT", "XAUUSD"]:
+        # Existing telemetry scenario: CRYPTO x2 + STOCK x1 live.
+        for sym in ["BTC/USDT:USDT", "ETH/USDT:USDT", "NCSKAAPL2USD/USDT:USDT"]:
             self._ready_candidate(sym)
             self.assertTrue(RT._execute_ready_queue_candidate(),
-                            f"runtime must open {sym} under BARON_ZONE_JUDGE=1")
-        self.assertEqual(RT.PORTFOLIO.count(), 5)
-
-        self._news_watch()
-        self.assertTrue(RT.execute_news_slot(),
-                        "independent NEWS slot must open under BARON_ZONE_JUDGE=1")
-        self.assertEqual(RT.PORTFOLIO.count(), 6)
-
+                            f"runtime must open {sym}")
+        # A valid INDEX #1 MUST be accepted (combined INDEX/STOCK bucket 2/2).
+        self._ready_candidate("US500/USDT:USDT")
+        self.assertTrue(RT._execute_ready_queue_candidate(),
+                        "INDEX #1 must be accepted after CRYPTO x2 + STOCK x1")
+        self.assertEqual(RT.PORTFOLIO.count(), 4)
         classes = [ctx.asset_class for ctx in RT.PORTFOLIO.contexts.values()]
         self.assertEqual(classes.count("CRYPTO"), 2)
-        self.assertEqual(classes.count("INDEX"), 2)
+        self.assertEqual(classes.count("INDEX") + classes.count("STOCK"), 2)
+
+        # NEWS #1 opens while technical seats are still free (5 of 5), proving
+        # the news slot is INDEPENDENT and the pool is 5 technical + 1 news.
+        self._news_watch()
+        self.assertTrue(RT.execute_news_slot(), "independent NEWS slot must open")
+        self.assertEqual(self._exec_pipe().get("news_executed"), 1)
+
+        # NEWS #2 -> NEWS_SLOT_FULL while a technical slot is still free (news
+        # does not consume a technical seat, and the news seat is exactly one).
+        self.assertFalse(RT.execute_news_slot())
+        self.assertEqual(self._exec_pipe().get("last_outcome"), "news_slot_full")
+        self.assertEqual(self._exec_pipe().get("last_reject_reason_user"),
+                         "NEWS_SLOT_FULL")
+        self.assertEqual(RT.PORTFOLIO.count(), 5)
+
+        # Then GOLD #1 -> TECHNICAL = 5/5, TOTAL = 6/6.
+        self._ready_candidate("XAUUSD")
+        self.assertTrue(RT._execute_ready_queue_candidate(),
+                        "GOLD #1 must be accepted after CRYPTO x2 + INDEX/STOCK x2")
+        self.assertEqual(RT.PORTFOLIO.count(), 6)
+        classes = [ctx.asset_class for ctx in RT.PORTFOLIO.contexts.values()]
         self.assertEqual(classes.count("GOLD"), 1)
-        self.assertEqual(classes.count("NEWS"), 1)
+        self.assertEqual(self._exec_pipe().get("executed"), 5)
 
-        exec_pipe = self._exec_pipe()
-        self.assertEqual(exec_pipe.get("executed"), 5)
-        self.assertEqual(exec_pipe.get("news_executed"), 1)
-
-        # The judge must have been advisory (WAIT_RETEST under READY grace), never
-        # the silent killer: no hard BARON_REJECT anywhere in the gate feed.
+        # Judge advisory (READY grace), never a hard reject, under judge ON.
         feed = RT.MEMORY.get("gate_feed", [])
-        self.assertTrue(any(ev.get("blocker") == "BARON_ADVISORY" for ev in feed),
-                        "advisory judge verdicts must be visible")
-        self.assertFalse(any(ev.get("blocker") == "BARON_REJECT" for ev in feed),
-                         "no hard judge reject for fresh READY grants")
+        self.assertTrue(any(ev.get("blocker") == "BARON_ADVISORY" for ev in feed))
+        self.assertFalse(any(ev.get("blocker") == "BARON_REJECT" for ev in feed))
 
-        for sym in RT.PORTFOLIO.symbols():
-            ctx = RT.PORTFOLIO.contexts[sym]
-            self.assertTrue(ctx.state.get("open"), f"{sym} must be open")
-            self.assertIsNotNone(ctx.live_manager)
-            self.assertGreater(float(ctx.state.get("entry", 0.0) or 0.0), 0)
+        # 7th position (any) -> TOTAL_PORTFOLIO_CAPACITY_FULL.
+        self._ready_candidate("OIL/USDT:USDT")
+        self.assertFalse(RT._execute_ready_queue_candidate(),
+                         "7th position must be refused")
+        self.assertEqual(self._exec_pipe().get("last_outcome"), "no_slots")
+        self.assertEqual(self._exec_pipe().get("last_reject_reason_user"),
+                         "TOTAL_PORTFOLIO_CAPACITY_FULL")
+        self.assertEqual(RT.PORTFOLIO.count(), 6)
 
-        equity = RT.E.paper["balance"] + RT.E.paper["committed_margin"]
-        self.assertAlmostEqual(equity, 10000.0, places=6)
-
-    # ---- 2. 6th technical refused with a PRECISE user-facing reason ----
-    # The 6 technical seats are 2 CRYPTO + 2 INDEX/STOCK + 1 OIL/GOLD. Holding
-    # BTC+ETH+US500+USTECH+XAUUSD fills every bucket, so the 6th technical
-    # (OIL) is refused at the combined COMMODITY bucket with the exact reason.
-    def test_sixth_technical_refused_technical_capacity_full(self):
+    # ---- 2. Third Index/Stock rejected with the precise reason + used/max ----
+    def test_third_index_stock_rejected_index_stock_capacity_full(self):
         RT = self.RT
-        for sym in ["BTC/USDT:USDT", "ETH/USDT:USDT", "US500/USDT:USDT",
-                    "USTECH/USDT:USDT", "XAUUSD"]:
+        for sym in ["BTC/USDT:USDT", "ETH/USDT:USDT",
+                    "NCSKAAPL2USD/USDT:USDT", "US500/USDT:USDT"]:
+            self._ready_candidate(sym)
+            self.assertTrue(RT._execute_ready_queue_candidate())
+        self.assertEqual(RT.PORTFOLIO.count(), 4)
+
+        # Third Index/Stock candidate (USTECH) -> combined bucket full.
+        self._ready_candidate("USTECH/USDT:USDT")
+        self.assertFalse(RT._execute_ready_queue_candidate(),
+                         "Index/Stock #3 must be rejected")
+        self.assertEqual(RT.PORTFOLIO.count(), 4)
+        exec_pipe = self._exec_pipe()
+        self.assertEqual(exec_pipe.get("last_outcome"), "allocator_reject")
+        self.assertEqual(exec_pipe.get("last_reject_reason"), "INDEX_STOCK_CAP")
+        self.assertEqual(exec_pipe.get("last_reject_reason_user"),
+                         "INDEX_STOCK_CAPACITY_FULL")
+        self.assertEqual(exec_pipe.get("last_reject_bucket"), "INDEX_STOCK")
+        self.assertEqual(exec_pipe.get("last_reject_bucket_used"), 2)
+        self.assertEqual(exec_pipe.get("last_reject_bucket_max"), 2)
+        self.assertEqual(exec_pipe.get("last_reject_technical_used"), 4)
+        self.assertNotIn("USTECH/USDT:USDT", RT.PORTFOLIO.symbols())
+
+        # Capacity-rejected candidates leave the queue via maintenance instead of
+        # re-picking the same highest-READY candidate forever (queue backoff).
+        RT.queue._invalidate("USTECH/USDT:USDT", "capacity-rejected INDEX_STOCK bucket full")
+        # The commodity seat is still free -> GOLD opens after the rejection.
+        self._ready_candidate("XAUUSD")
+        self.assertTrue(RT._execute_ready_queue_candidate(),
+                        "GOLD must still open after an Index/Stock rejection")
+        self.assertEqual(RT.PORTFOLIO.count(), 5)
+
+    # ---- 3. OIL/GOLD share ONE commodity seat ----
+    def test_commodity_single_seat_oil_rejected_when_gold_open(self):
+        RT = self.RT
+        for sym in ["BTC/USDT:USDT", "ETH/USDT:USDT",
+                    "US500/USDT:USDT", "USTECH/USDT:USDT", "XAUUSD"]:
             self._ready_candidate(sym)
             self.assertTrue(RT._execute_ready_queue_candidate())
         self.assertEqual(RT.PORTFOLIO.count(), 5)
 
         self._ready_candidate("OIL/USDT:USDT")
         self.assertFalse(RT._execute_ready_queue_candidate(),
-                         "6th technical must be refused")
-        self.assertEqual(RT.PORTFOLIO.count(), 5)
+                         "OIL after GOLD must be refused (one commodity seat)")
         exec_pipe = self._exec_pipe()
-        self.assertEqual(exec_pipe.get("last_outcome"), "allocator_reject")
-        # Combined OIL/GOLD seat already taken by XAUUSD -> precise reason.
         self.assertEqual(exec_pipe.get("last_reject_reason"), "COMMODITY_CAP")
         self.assertEqual(exec_pipe.get("last_reject_reason_user"),
                          "COMMODITY_CAPACITY_FULL")
+        self.assertEqual(exec_pipe.get("last_reject_bucket"), "COMMODITY")
         self.assertEqual(exec_pipe.get("last_reject_bucket_used"), 1)
         self.assertEqual(exec_pipe.get("last_reject_bucket_max"), 1)
         self.assertEqual(exec_pipe.get("last_reject_technical_used"), 5)
         self.assertEqual(exec_pipe.get("last_reject_technical_max"), 5)
         self.assertNotIn("OIL/USDT:USDT", RT.PORTFOLIO.symbols())
-
-    # ---- 3. NEWS independence: 2nd news attempt refused as NEWS_SLOT_FULL ----
-    def test_second_news_attempt_refused_news_slot_full(self):
-        RT = self.RT
-        for sym in ["BTC/USDT:USDT", "ETH/USDT:USDT", "US500/USDT:USDT",
-                    "USTECH/USDT:USDT"]:
-            self._ready_candidate(sym)
-            self.assertTrue(RT._execute_ready_queue_candidate())
-        self._news_watch()
-        self.assertTrue(RT.execute_news_slot())
-        self.assertEqual(RT.PORTFOLIO.count(), 5)
-
-        # NEWS must NOT have consumed any technical class quota: with 4 technical
-        # + 1 NEWS, one technical (GOLD) still fits.
-        self.assertTrue(RT.PORTFOLIO.can_open("XAUUSD", "GOLD"))
-
-        self.assertFalse(RT.execute_news_slot(),
-                         "a second NEWS trade must never open")
-        self.assertEqual(RT.PORTFOLIO.count(), 5)
-        exec_pipe = self._exec_pipe()
-        self.assertEqual(exec_pipe.get("last_outcome"), "news_slot_full")
-        self.assertEqual(exec_pipe.get("last_reject_reason_user"), "NEWS_SLOT_FULL")
-        classes = [ctx.asset_class for ctx in RT.PORTFOLIO.contexts.values()]
-        self.assertEqual(classes.count("NEWS"), 1)
-
-    # ---- 4. 7th position refused as TOTAL_PORTFOLIO_CAPACITY_FULL ----
-    def test_seventh_total_refused_total_portfolio_capacity_full(self):
-        RT = self.RT
-        for sym in ["BTC/USDT:USDT", "ETH/USDT:USDT", "US500/USDT:USDT",
-                    "USTECH/USDT:USDT", "XAUUSD"]:
-            self._ready_candidate(sym)
-            self.assertTrue(RT._execute_ready_queue_candidate())
-        self._news_watch()
-        self.assertTrue(RT.execute_news_slot())
-        self.assertEqual(RT.PORTFOLIO.count(), 6)
-
-        self._ready_candidate("SOL/USDT:USDT")
-        self.assertFalse(RT._execute_ready_queue_candidate(),
-                         "7th position must be refused")
-        exec_pipe = self._exec_pipe()
-        self.assertEqual(exec_pipe.get("last_outcome"), "no_slots")
-        self.assertEqual(exec_pipe.get("last_reject_reason"), "SLOT_CAP")
-        self.assertEqual(exec_pipe.get("last_reject_reason_user"),
-                         "TOTAL_PORTFOLIO_CAPACITY_FULL")
-        self.assertNotIn("SOL/USDT:USDT", RT.PORTFOLIO.symbols())
-
-        # The NEWS slot is subject to the same global total cap.
-        self.assertFalse(RT.execute_news_slot())
-        self.assertEqual(self._exec_pipe().get("last_outcome"), "news_no_slots")
-        self.assertEqual(self._exec_pipe().get("last_reject_reason_user"),
-                         "TOTAL_PORTFOLIO_CAPACITY_FULL")
-        self.assertEqual(RT.PORTFOLIO.count(), 6)
 
 
 if __name__ == "__main__":

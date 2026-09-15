@@ -127,13 +127,13 @@ class PortfolioManager:
 
     @staticmethod
     def _class_cap(cls: str) -> int:
-        """Per-class slot capacity for the 6-market model.
+        """Capacity of the technical bucket a class belongs to.
 
-        Source of truth is portfolio.allocator.DEFAULT_CLASS_CAPS, so the
-        allocator report and the open authority always agree:
-        CRYPTO:2 / INDEX:2 / GOLD:1 / OIL:1, plus the independent NEWS:1 slot.
-        Classes outside the market model (STOCK, ...) get cap 0 -- discovered
-        but never opened as a portfolio slot.
+        Source of truth is portfolio.allocator.DEFAULT_CLASS_CAPS via the
+        bucket mapping, so the allocator report and the open authority always
+        agree:
+        CRYPTO:2 / INDEX+STOCK combined bucket:2 / OIL+GOLD combined bucket:1,
+        plus the independent NEWS:1 slot.
         The env master override MAX_POSITIONS_PER_ASSET_CLASS applies to EVERY
         class when explicitly set only (no 999 fake default).
         """
@@ -145,11 +145,11 @@ class PortfolioManager:
         env = os.getenv("MAX_POSITIONS_PER_ASSET_CLASS", "").strip()
         if env:
             return max(1, int(env))
-        from portfolio.allocator import DEFAULT_CLASS_CAPS
-        # The six-market portfolio model is intentionally explicit. Classes
-        # outside that model (e.g. STOCK) may be discovered/scored upstream but
-        # are not eligible for these six execution slots.
-        return int(DEFAULT_CLASS_CAPS.get(str(cls).upper(), 0))
+        from portfolio.allocator import bucket_cap, bucket_of
+        # Combined buckets are the single capacity unit (INDEX and STOCK share
+        # one 2-seat bucket; OIL and GOLD share one 1-seat bucket). Classes
+        # outside that model keep bucket cap 0 -- discovered but never opened.
+        return bucket_cap(bucket_of(str(cls).upper()))
 
     def _ctx_class(self, pos) -> str:
         """Class of an open context: prefer the EXPLICIT class stored at OPEN
@@ -171,8 +171,46 @@ class PortfolioManager:
             technical_open = sum(1 for pos in self.contexts.values() if self._ctx_class(pos) != "NEWS")
             if technical_open >= self.max_technical_positions:
                 return False
-            current = sum(1 for pos in self.contexts.values() if self._ctx_class(pos) == cls)
+            # Capacity is counted per COMBINED bucket (INDEX+STOCK share a
+            # 2-seat seat; OIL/GOLD share one seat) — exactly the bucket the
+            # allocator enforces, so the two authorities never disagree.
+            from portfolio.allocator import bucket_of
+            bucket = bucket_of(cls)
+            current = sum(1 for pos in self.contexts.values() if bucket_of(self._ctx_class(pos)) == bucket)
             return current < self._class_cap(cls)
+
+    def _can_open_blocker(self, symbol: str, asset_class: str | None = None) -> str:
+        """WHY can_open would refuse this candidate today. Mirrors the exact
+        gate order of can_open and returns a traceable token (DUPLICATE /
+        TOTAL_CAPACITY_FULL / RISK_REJECT / TECHNICAL_CAPACITY_FULL /
+        NEWS_SLOT_FULL / <bucket>_CAPACITY_FULL). Never raises."""
+        try:
+            if self._has_context(symbol):
+                return "DUPLICATE"
+            if len(self.contexts) >= self.max_positions:
+                return "TOTAL_CAPACITY_FULL"
+            if not self.risk_guard.can_open(symbol, len(self.contexts)):
+                return "RISK_REJECT"
+            cls = self._asset_class(symbol, asset_class)
+            if cls == "NEWS":
+                current_news = sum(1 for pos in self.contexts.values() if self._ctx_class(pos) == "NEWS")
+                return "NEWS_SLOT_FULL" if current_news >= 1 else ""
+            technical_open = sum(1 for pos in self.contexts.values() if self._ctx_class(pos) != "NEWS")
+            if technical_open >= self.max_technical_positions:
+                return "TECHNICAL_CAPACITY_FULL"
+            from portfolio.allocator import bucket_of
+            bucket = bucket_of(cls)
+            current = sum(1 for pos in self.contexts.values() if bucket_of(self._ctx_class(pos)) == bucket)
+            if current >= self._class_cap(cls):
+                return {
+                    "CRYPTO": "CRYPTO_SLOT_FULL",
+                    "INDEX_STOCK": "INDEX_STOCK_CAPACITY_FULL",
+                    "COMMODITY": "COMMODITY_CAPACITY_FULL",
+                    "NEWS": "NEWS_SLOT_FULL",
+                }.get(bucket, f"{bucket}_CAPACITY_FULL")
+            return ""
+        except Exception:
+            return "UNKNOWN"
 
     def _capture(self):
         if not self.engine or not self.active_symbol:
@@ -282,6 +320,14 @@ class PortfolioManager:
             # Do not materialize rejected capacity/risk intents as active trade
             # records. This prevents restart recovery from mistaking a rejected
             # candidate for a live position.
+            if self.engine is not None:
+                try:
+                    blocker = self._can_open_blocker(symbol, candidate.get("asset_class"))
+                    if blocker:
+                        _lc = self.engine.MEMORY.setdefault("opportunity_lifecycle", {}).setdefault(symbol, {})
+                        _lc["primary_blocker"] = blocker
+                except Exception:
+                    pass
             return False
         self.trade_registry.upsert(TradeRecord(
             trade_id=trade_id, symbol=symbol, side=str(candidate.get("side", "BUY")).upper(),

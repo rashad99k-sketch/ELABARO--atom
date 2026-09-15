@@ -332,6 +332,70 @@ def _class_ready_score_floor(candidate):
         return 75.0
 
 
+# Classification of open_candidate_failed events. Every failure is split into an
+# explicit category (never one generic bucket) so dashboard telemetry can show a
+# breakdown instead of a single counter.
+OPEN_FAILURE_CATEGORY_ORDER = (
+    ("BARON_ERROR", "judge_error"),
+    ("BARON_REJECT", "judge_block"),
+    ("EXECUTION_ERROR", "execution_error"),
+    ("MARGIN", "sizing_margin"),
+    ("QTY", "sizing_qty"),
+    ("ADX", "adx_reject"),
+    ("LIQUIDITY", "liquidity_reject"),
+    ("ENTRY_QUALITY", "entry_quality"),
+    ("RISK", "risk_reject"),
+    ("DUPLICATE", "duplicate"),
+    ("NEWS_SLOT_FULL", "news_capacity"),
+    ("TOTAL_CAPACITY_FULL", "total_capacity"),
+    ("TECHNICAL_CAPACITY_FULL", "technical_capacity"),
+    ("_CAPACITY_FULL", "capacity"),
+    ("_CAP", "capacity"),
+    ("DATA", "data"),
+    ("SESSION", "session"),
+    ("SPREAD", "spread"),
+    ("SYMBOL", "symbol_mapping"),
+    ("COOLDOWN", "cooldown"),
+    ("UNKNOWN", "unknown"),
+)
+
+
+def _classify_open_failure(symbol, side: str, exec_pipe: dict) -> None:
+    """Bucket a PORTFOLIO.open_candidate failure into a precise category using
+    the breadcrumbs the path itself left (portfolio manager _can_open_blocker,
+    engine _record_exec_blocker -> last_open_outcome, EXECUTION_ERROR). Pure
+    accounting; never raises; never re-decides the entry."""
+    try:
+        lc = MEMORY.setdefault("opportunity_lifecycle", {}).get(symbol, {})
+        token = str(lc.get("primary_blocker") or "")
+        if not token:
+            _st = STATE if isinstance(STATE, dict) else {}
+            _out = str(_st.get("last_open_outcome") or "")
+            if _out.startswith("OPEN_REJECTED:"):
+                token = _out.split(":", 1)[1].strip()
+            else:
+                _bl = _st.get("last_exec_blocker") or {}
+                if isinstance(_bl, dict):
+                    token = str(_bl.get("blocker") or "")
+        if not token:
+            token = str(lc.get("execution_error") or "UNKNOWN")
+        upper = token.upper()
+        category = "other"
+        for _frag, _cat in OPEN_FAILURE_CATEGORY_ORDER:
+            if _frag in upper:
+                category = _cat
+                break
+        key = f"open_failure_category:{category}"
+        exec_pipe[key] = exec_pipe.get(key, 0) + 1
+        exec_pipe["last_open_failure_category"] = category
+        exec_pipe["last_open_failure_blocker"] = token
+    except Exception:
+        try:
+            exec_pipe["open_failure_category:unknown"] = exec_pipe.get("open_failure_category:unknown", 0) + 1
+        except Exception:
+            pass
+
+
 def _execute_ready_queue_candidate():
     """Execute only a READY queue candidate through PortfolioManager.
 
@@ -345,6 +409,9 @@ def _execute_ready_queue_candidate():
     # User-facing capacity labels mapped from the allocator's internal reasons.
     # Kept additive: internal reason strings (TECHNICAL_CAP, *_CAP, SLOT_CAP -
     # pinned by existing tests) are never rewritten, only surfaced alongside.
+    # Combined-bucket reasons (INDEX_STOCK_CAP, COMMODITY_CAP) map to explicit
+    # "capacity used=x/max=y" labels; legacy tokens (INDEX_CAP, GOLD_CAP,
+    # OIL_CAP) stay mapped for any historical trace.
     PORTFOLIO_REASON_USER = {
         "SLOT_CAP": "TOTAL_PORTFOLIO_CAPACITY_FULL",
         "TECHNICAL_CAP": "TECHNICAL_CAPACITY_FULL",
@@ -353,6 +420,8 @@ def _execute_ready_queue_candidate():
         "GOLD_CAP": "GOLD_SLOT_FULL",
         "OIL_CAP": "OIL_SLOT_FULL",
         "NEWS_CAP": "NEWS_SLOT_FULL",
+        "INDEX_STOCK_CAP": "INDEX_STOCK_CAPACITY_FULL",
+        "COMMODITY_CAP": "COMMODITY_CAPACITY_FULL",
     }
 
     exec_pipe = MEMORY.setdefault("pipeline", {}).setdefault("execution", {})
@@ -474,10 +543,23 @@ def _execute_ready_queue_candidate():
                     _reason_user = PORTFOLIO_REASON_USER.get(decision.reason, decision.reason)
                     exec_pipe["last_reject_reason"] = decision.reason
                     exec_pipe["last_reject_reason_user"] = _reason_user
+                    # Full capacity trace: symbol / class / bucket used+max /
+                    # technical used+max / news used+max / total used+max, so
+                    # the dashboard shows exactly where the candidate died
+                    # instead of a bare token like STOCK_CAP.
+                    exec_pipe["last_reject_symbol"] = decision.symbol
+                    exec_pipe["last_reject_asset_class"] = decision.asset_class
+                    for _k, _v in decision.trace_dict().items():
+                        exec_pipe[f"last_reject_{_k}"] = _v
                     E.record_gate_event(candidate["symbol"], "RISK", "ALLOCATOR_REJECT",
-                                        f"{decision.reason} ({_reason_user})", candidate["side"])
+                                        f"{decision.reason} ({_reason_user}) "
+                                        f"bucket={decision.bucket} {decision.bucket_used}/{decision.bucket_max}",
+                                        candidate["side"])
                     log_execution(
-                        f"[PORTFOLIO] {candidate['symbol']} rejected: {decision.reason}",
+                        f"[PORTFOLIO] {candidate['symbol']} rejected: {decision.reason} "
+                        f"[{decision.bucket} {decision.bucket_used}/{decision.bucket_max} "
+                        f"tech {decision.technical_used}/{decision.technical_max} "
+                        f"total {decision.total_used}/{decision.total_max}]",
                         "INFO",
                         debounce_key=f"alloc_reject_{candidate['symbol']}",
                         debounce_sec=60,
@@ -518,6 +600,7 @@ def _execute_ready_queue_candidate():
             )
             return True
         _exec_gate("open_candidate_failed")
+        _classify_open_failure(best.symbol, best.side, exec_pipe)
     except Exception as exc:
         log_execution(f"[QUEUE] ready execution error: {exc}", "ERROR")
         # A swallowed exception here used to leave the candidate READY and emit

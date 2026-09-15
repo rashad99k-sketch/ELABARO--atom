@@ -109,6 +109,7 @@ if "flask" not in sys.modules:
     import importlib.machinery as _machinery
     flask.__spec__ = _machinery.ModuleSpec("flask", loader=None)
     sys.modules["flask"]=flask
+    _CONFTEST_FLASK = flask
 
 def pytest_runtest_setup(item):
     # A few legacy tests deliberately replace dependency modules with their own
@@ -118,3 +119,20 @@ def pytest_runtest_setup(item):
         mod = sys.modules.get(name)
         if mod is not None and getattr(mod, "__spec__", None) is None:
             mod.__spec__ = importlib.machinery.ModuleSpec(name, loader=None)
+    # Test files swap in their own flask boundary stubs inside test bodies.
+    # dashboard/app.py re-pins its Flask/jsonify/request bindings to whichever
+    # flask module is registered at import time, so a cached dashboard.app built
+    # under the conftest boundary stays valid for the whole process. Reinstate
+    # the conftest flask boundary before every test so no test ever imports
+    # (or re-imports) a dashboard route under a foreign stub.
+    if "flask" in sys.modules:
+        sys.modules["flask"] = _CONFTEST_FLASK
+
+
+def _normalize_flask_boundary():
+    if "flask" in sys.modules:
+        sys.modules["flask"] = _CONFTEST_FLASK
+
+
+def pytest_runtest_teardown(item, nextitem):
+    _normalize_flask_boundary()
