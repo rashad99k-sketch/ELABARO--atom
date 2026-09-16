@@ -2784,6 +2784,14 @@ class AssetBehaviorProfile:
                    "roe_trail_activate": 0.8, "runner_bias": 0.5},
     }
 
+    # Full set of classes the authoritative classifier may return. Kept separate
+    # from DEFAULT (which only holds tuned profiles) so ETF/METAL/ENERGY/FOREX
+    # and fail-closed UNKNOWN resolve through resolve_asset_class instead of
+    # dropping into the legacy heuristics.
+    _RESOLVED_CLASSES = frozenset(
+        {"CRYPTO", "INDEX", "STOCK", "ETF", "GOLD", "OIL", "METAL", "ENERGY",
+         "FOREX", "UNKNOWN"})
+
     # Per asset-class Order-Block / zone detection tuning (OB_ASSET_TUNING).
     # OB_UNIFIED mirrors the legacy hardcoded behaviour exactly; when tuning is
     # disabled the merged config for EVERY class equals OB_UNIFIED so no existing
@@ -2888,12 +2896,13 @@ class AssetBehaviorProfile:
     @classmethod
     def resolve_asset_class(cls, symbol: str) -> str:
         """Best-effort asset classification from a symbol when portfolio context
-        is not available. Returns one of CRYPTO/INDEX/GOLD/OIL/STOCK — or FOREX
-        for NCFX instruments (discovered, never opened: cap-0 fail-closed)."""
+        is not available. Returns one of CRYPTO/INDEX/STOCK/ETF/GOLD/OIL/METAL/
+        ENERGY/FOREX — or UNKNOWN, never CRYPTO, when no exchange-grounded
+        evidence exists (a malformed or metadata-free shape must fail closed)."""
         try:
             from portfolio.manager import PortfolioManager
             ac = PortfolioManager._asset_class(symbol)
-            if ac and (ac.upper() in cls.DEFAULT or ac.upper() == "FOREX"):
+            if ac and ac.upper() in cls._RESOLVED_CLASSES:
                 return ac.upper()
         except Exception:
             pass
@@ -2906,7 +2915,12 @@ class AssetBehaviorProfile:
             return "INDEX"
         if any(t in up for t in ("AAPL", "MSFT", "TSLA", "AMZN", "GOOG", "NVDA", "META", "NFLX")):
             return "STOCK"
-        return "CRYPTO"
+        if any(t in up for t in ("EWJ", "EWY", "QQQ", "SPY", "TQQQ", "DIA")):
+            return "ETF"
+        # FAIL-CLOSED tail: CRYPTO requires the venue margin-pair shape.
+        if "USDT" in up or "USDC" in up:
+            return "CRYPTO"
+        return "UNKNOWN"
 
 
 # -----------------------------------------------------------------------------
@@ -13963,6 +13977,22 @@ class ExecutionCandidate:
     move_maturity: str = "UNKNOWN"
     early_formation: dict = field(default_factory=dict)
 
+    def __post_init__(self):
+        # FAIL-CLOSED custody of the legacy "CRYPTO" default: a TradFi family
+        # symbol (NCSK/NCSI/NCCO/NCFX) must resolve to its REAL class up-front,
+        # so an omitted asset_class can never silently plant a
+        # stock/ETF/index/commodity/forex candidate into the CRYPTO bucket.
+        # Non-family, venue-pair symbols (USDT/USDC quote) keep the CRYPTO
+        # default; any other shape (malformed / metadata-free) resolves through
+        # the authoritative classifier to UNKNOWN — never CRYPTO.
+        if self.asset_class == "CRYPTO" and self.symbol:
+            up = str(self.symbol).upper()
+            if (up.split("/")[0].startswith(("NCSI", "NCSK", "NCCO", "NCFX"))
+                    or ("USDT" not in up and "USDC" not in up)):
+                resolved = AssetBehaviorProfile.resolve_asset_class(self.symbol)
+                if resolved and resolved != "CRYPTO":
+                    self.asset_class = resolved
+
     def zone_mid(self) -> float:
         if self.zone_low and self.zone_high:
             return (self.zone_low + self.zone_high) / 2.0
@@ -15288,6 +15318,17 @@ class ExecutionQueue:
             return
         with self._lock:
             for symbol, cand in list(self._candidates.items()):
+                # Terminal states must never be re-evaluated (they are awaiting
+                # cleanup only). Skipping here prevents a resurrected READY
+                # reprocessing a just-opened or invalidated candidate.
+                # NOTE: RETURNED_WATCHLIST is deliberately NOT terminal — the
+                # zone-lifecycle contract requires returned candidates to be
+                # re-evaluated so an escaped zone can advance EXPANDED_AWAY ->
+                # STALE (and _update_zone_lifecycle below keeps genuinely
+                # returned/invalidated candidates from reaching READY).
+                if cand.state in (ExecutionState.EXECUTED,
+                                  ExecutionState.INVALIDATED):
+                    continue
                 if (cand.institutional_score >= 70 and
                     cand.pre_institutional_state in ("CONFIRMED", "PRE_ENTRY_READY")):
                     df = data_fetcher(symbol)

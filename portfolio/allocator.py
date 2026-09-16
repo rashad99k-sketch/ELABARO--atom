@@ -55,11 +55,17 @@ ASSET_BUCKETS = {
     "CRYPTO": "CRYPTO",
     "INDEX": "INDEX_STOCK",
     "STOCK": "INDEX_STOCK",
+    "ETF": "INDEX_STOCK",
     "OIL": "COMMODITY",
     "GOLD": "COMMODITY",
+    "METAL": "COMMODITY",
     "ENERGY": "COMMODITY",
     "METALS": "COMMODITY",
     "COMMODITIES": "COMMODITY",
+    # FOREX keeps its own reasoned cap-0 bucket: discovered/analyzed but never
+    # opened (capacity spec is fixed at 6 seats; no Forex seat exists), and it
+    # can never silently fall into the CRYPTO bucket.
+    "FOREX": "FOREX",
     "NEWS": "NEWS",
 }
 # Bucket representative class -> per-class cap lookup, so DEFAULT_CLASS_CAPS
@@ -111,6 +117,7 @@ class AllocationDecision:
     total_used: int = 0
     total_max: int = 0
     class_counts: Optional[Dict[str, int]] = None
+    candidate_key: str = ""
 
     def trace_dict(self) -> dict:
         """Exact capacity snapshot at decision time (used = pre-decision state,
@@ -260,6 +267,7 @@ class GlobalAssetAllocator:
                         news_used=news_used, news_max=bucket_cap("NEWS"),
                         total_used=total_used, total_max=limit,
                         class_counts=hash_bias,
+                        candidate_key=cand.get("candidate_key", ""),
                     ))
             # If any slot is unused, explain why.
             total = len([d for d in decisions if d.allowed])

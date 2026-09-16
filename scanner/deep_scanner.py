@@ -881,7 +881,10 @@ class DeepScanner:
 
     def _analyze_symbol(self, entry: dict) -> dict | None:
         sym = entry["symbol"]
-        asset = entry.get("asset_class", "CRYPTO")
+        # FAIL-CLOSED: a missing watch asset_class must derive from the
+        # authoritative resolver (UNKNOWN for metadata-free shapes) — never the
+        # legacy silent "CRYPTO" default that could re-label a TradFi symbol.
+        asset = entry.get("asset_class") or E.AssetBehaviorProfile.resolve_asset_class(sym)
         try:
             if getattr(E, "SYMBOL_GUARD", None) is not None and E.SYMBOL_GUARD.is_paused(sym):
                 return None

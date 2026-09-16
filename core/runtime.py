@@ -591,6 +591,8 @@ def _execute_ready_queue_candidate():
             "tp1": best.take_profit_1,
             "tp2": best.take_profit_2,
             "score": best.priority_score,
+            "priority_score": best.priority_score,
+            "candidate_key": f"runtime:{best.symbol}:{best.side}",
             "atr": best.atr,
             "scenario": best.opportunity_type.value,
             "asset_class": _cand_ac,
@@ -620,11 +622,30 @@ def _execute_ready_queue_candidate():
         # PORTFOLIO.contexts; forwarding them into the allocator snapshot would
         # double-count capacity and wrongly cap new entries of the same class.
         queue_snapshot = [c.to_dict() for c in queue._candidates.values()
-                          if c.state != ExecutionState.EXECUTED]
+                          if c.state != ExecutionState.EXECUTED and c.symbol != best.symbol]
         alloc_report = ALLOCATOR.allocate(queue_snapshot + [candidate], limit=PORTFOLIO.max_positions)
-        for decision in alloc_report.decisions:
-            if decision.symbol == candidate["symbol"]:
-                if not decision.allowed:
+        # DETERMINISTIC DECISION MATCH: the runtime candidate carries a unique
+        # candidate_key; the allocator copies it onto its decision, so the loop
+        # below matches by key FIRST and only falls back to first-match-by-
+        # symbol (which previously let the queued candidate's to_dict decision
+        # win — the split-brain where the queue showed CRYPTO while this
+        # candidate was STOCK). queue_snapshot also excludes the current `best`
+        # so its symbol appears exactly once in the allocator list.
+        candidate_key = candidate.get("candidate_key", "")
+        decision = None
+        for _d in alloc_report.decisions:
+            if candidate_key and _d.candidate_key == candidate_key:
+                decision = _d
+                break
+        if decision is None:
+            for _d in alloc_report.decisions:
+                if _d.symbol == candidate["symbol"]:
+                    decision = _d
+                    break
+        if decision is None:
+            _exec_gate("allocator_error")
+            return False
+        if not decision.allowed:
                     MEMORY["portfolio_allocation"] = alloc_report.to_dict()
                     _exec_gate("allocator_reject")
                     _reason_user = PORTFOLIO_REASON_USER.get(decision.reason, decision.reason)
@@ -688,7 +709,6 @@ def _execute_ready_queue_candidate():
                         next_queue_action="backoff+advance_queue",
                     )
                     return False
-                break
 
         MEMORY["portfolio_allocation"] = alloc_report.to_dict()
         # Lifecycle observability: allocator stage committed for this candidate.
@@ -745,9 +765,30 @@ def _execute_ready_queue_candidate():
         # failures (RISK, ADX, liquidity, execution) keep retry_next_cycle —
         # they are transient and must not be masked.
         _oa_cat = exec_pipe.get("last_open_failure_category", "other")
+        _oa_next = None
+        # FIX#4 (live-position reprocessing): a DUPLICATE blocker means the swap
+        # engine refused because a REAL position already lives on this symbol —
+        # a deterministic, permanent condition, not a transient failure. Retrying
+        # every cycle would loop forever on the same highest-READY candidate.
+        # The queued candidate is INVALIDATED and removed so the queue advances;
+        # next_queue_action documents why it left.
+        if _oa_cat == "duplicate" and PORTFOLIO._has_context(best.symbol):
+            _oa_next = "position_already_open_removed"
+            try:
+                with queue._lock:
+                    _qd = queue._candidates.pop(best.symbol, None)
+                if _qd is not None:
+                    _qd.state = ExecutionState.INVALIDATED
+                    _qd.last_allocator_reason = "POSITION_ALREADY_OPEN"
+                    queue.total_rejected += 1
+                E.record_gate_event(
+                    best.symbol, "EXECUTION", "POSITION_ALREADY_OPEN",
+                    "LIVE position exists; READY entry removed from queue", best.side)
+            except Exception:
+                _oa_next = "retry_next_cycle"
         _oa_is_capacity = _oa_cat in ("capacity", "news_capacity",
                                       "total_capacity", "technical_capacity")
-        if _oa_is_capacity:
+        if _oa_next is None and _oa_is_capacity:
             try:
                 _bsoff = float(os.getenv("QUEUE_ALLOCATOR_BACKOFF_SEC", "300"))
                 _kand = queue._candidates.get(best.symbol)
@@ -757,7 +798,8 @@ def _execute_ready_queue_candidate():
                     _kand.last_allocator_reason_user = str(exec_pipe.get("last_open_failure_blocker", "CAPACITY"))
             except Exception:
                 pass
-        _oa_next = "backoff+advance_queue" if _oa_is_capacity else "retry_next_cycle"
+        if _oa_next is None:
+            _oa_next = "backoff+advance_queue" if _oa_is_capacity else "retry_next_cycle"
         _watch_ac = watch.get("asset_class") if isinstance(watch, dict) else ""
         _record_open_attempt(
             exec_pipe,

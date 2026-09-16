@@ -1071,6 +1071,20 @@ def _safe_numeric(value, default=50.0):
         return float(default)
 
 
+def _has_live_context(symbol):
+    """True when a real (already-open) position exists for symbol.
+
+    Imported lazily to avoid the scanner<->runtime import cycle; this guard is
+    only reachable at call time when core.runtime has already loaded the shared
+    portfolio singleton. It blocks NEW OPEN re-admission of a LIVE position.
+    """
+    try:
+        from core.runtime import PORTFOLIO
+        return bool(PORTFOLIO is not None and PORTFOLIO._has_context(symbol))
+    except Exception:
+        return False
+
+
 def promote_to_queue():
     """Prepare early institutional candidates for live execution re-evaluation.
 
@@ -1152,6 +1166,12 @@ def promote_to_queue():
             continue
         if sym in queue._candidates:
             _rej("already_in_queue")
+            continue
+        if _has_live_context(sym):
+            _rej("position_already_open")
+            E.record_gate_event(sym, "PROMOTION", "POSITION_ALREADY_OPEN",
+                                "LIVE position exists (PORTFOLIO.contexts); NEW OPEN admission blocked",
+                                str(entry.get("side", "BUY")).upper())
             continue
         eligible += 1
 
@@ -1237,6 +1257,12 @@ def promote_to_queue():
             zone_state="ACTIVE", ob_cfg=qcfg
         )
         candidate.state = ExecutionState.DISCOVERED
+        # FAIL-CLOSED classification carry (forensic): the watch entry may carry
+        # an authoritative class; otherwise resolve from the symbol so a TradFi
+        # candidate can never ride the CRYPTO dataclass default into the bucket.
+        candidate.asset_class = (
+            str(entry.get("asset_class") or "")).upper() or \
+            E.AssetBehaviorProfile.resolve_asset_class(sym)
         candidate.priority_score = metrics.final_zone_score
         candidate.is_a_grade = is_a_grade
         candidate.strong_ob_present = str(analysis.get("ob_grade", "NONE")).upper() in {"A", "A+"}

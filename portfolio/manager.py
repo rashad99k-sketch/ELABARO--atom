@@ -131,7 +131,14 @@ class PortfolioManager:
         base = text.replace(":USDT", "").replace("/USDT", "").replace("-USDT", "")
         if base in stock_hints:
             return "STOCK"
-        return "CRYPTO"
+        # FAIL-CLOSED tail: CRYPTO is ONLY ever assigned to a venue-shaped
+        # margin pair (USDT/USDC quote present). A TradFi/unknown shape with no
+        # exchange-grounded evidence stays UNKNOWN — it can never silently
+        # become CRYPTO (that was the legacy fallback that put stock/ETF/forex
+        # instruments into the crypto bucket and consumed its capacity).
+        if "USDT" in text or "USDC" in text:
+            return "CRYPTO"
+        return "UNKNOWN"
 
     @staticmethod
     def _class_cap(cls: str) -> int:
@@ -164,7 +171,14 @@ class PortfolioManager:
         (e.g. the NEWS slot on a symbol whose name would classify as CRYPTO),
         falling back to symbol derivation for legacy contexts."""
         stored = getattr(pos, "asset_class", None)
-        return stored if stored else self._asset_class(pos.symbol)
+        if stored:
+            return stored
+        derived = self._asset_class(pos.symbol)
+        # Legacy contexts carry no stored class. A non-derivable symbol (no
+        # venue pair shape, no TradFi family/hint) was opened under the legacy
+        # CRYPTO-default regime, so it counts against the CRYPTO bucket —
+        # capacity must never be leaked by an UNKNOWN class (which has no seat).
+        return derived if derived != "UNKNOWN" else "CRYPTO"
 
     def can_open(self, symbol: str, asset_class: str | None = None) -> bool:
         with self._lock:

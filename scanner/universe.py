@@ -10,7 +10,18 @@ import os
 from collections import defaultdict
 from typing import Dict, Iterable, List
 
-ASSET_CLASSES = ("CRYPTO", "STOCK", "INDEX", "METAL", "GOLD", "OIL", "FOREX", "ENERGY")
+ASSET_CLASSES = ("CRYPTO", "STOCK", "ETF", "INDEX", "METAL", "GOLD", "OIL",
+                 "FOREX", "ENERGY", "UNKNOWN")
+
+# Venue family prefixes are the AUTHORITATIVE TradFi classifier. BingX lists
+# every TradFi perpetual under one of these bases; there is no productType /
+# category field on the venue, so the prefix + displayName ARE the sole
+# exchange-grounded evidence (see tests + BINGX research report).
+VENUE_TRADFI_PREFIXES = ("NCSK", "NCSI", "NCCO", "NCFX")
+
+# Never resolved from the market universe (exchange-grounded list).
+ETF_HINTS = ("EWJ", "EWY", "QQQ", "SPY", "TQQQ", "SQQQ", "SPXL", "DIA",
+             "FNGU", "FNGD", "SOXL", "SOXS", "TNA")
 
 STOCKS = set(x.strip().upper() for x in os.getenv("STOCK_SYMBOL_HINTS", "".join([
     "AAPL,AMZN,GOOGL,MSFT,NVDA,META,TSLA,NFLX,AMD,INTC,AVGO,ORCL,CRM,ADBE,",
@@ -44,10 +55,42 @@ def _text(symbol: str, market: dict) -> str:
 
 
 # Canonical prefix resolution: the venue uses NCSI for indices, NCSK for stocks,
-# NCCO for commodity/energy, NCCX/O for gold crosses.
+# NCCO for commodity/energy, NCFX for forex. The DISPLAY NAME additionally
+# distinguishes ETFs (EWJ/EWY/QQQ/SPY/...) that live under NCSI or NCSK.
 NCSI_PREFIX = "NCSI"
 NCSK_PREFIX = "NCSK"
 NCCO_PREFIX = "NCCO"
+NCFX_PREFIX = "NCFX"
+
+_VENUE_PAIR_MARKERS = ("USDT", "USDC")
+
+_FIAT_CODES = set(FOREX_HINTS) | {"USD"}
+
+
+def _is_fiat_pair(text: str, base: str) -> bool:
+    """True when the venue display evidence names a fiat currency pair.
+
+    A currency pair is the concatenation of two distinct 3-letter fiat codes
+    (EURUSD, USDJPY, GBPCHF...). Detected from venue-provided text only; this
+    never invents classes for metadata-free symbols.
+    """
+    upper = " ".join(str(x) for x in (text, base)).upper()
+    for a in _FIAT_CODES:
+        for b in _FIAT_CODES:
+            if a != b and (a + b) in upper:
+                return True
+    return False
+
+
+def _venue_pair(symbol: str) -> bool:
+    """True when the symbol has the venue's margin-pair shape (USDT/USDC).
+
+    NOTE: this ONLY anchors the CRYPTO fallback slot; a TradFi symbol also ends
+    in -USDT (e.g. NCSKSPCX2USD-USDT) but is caught first by the family prefix,
+    so venue pair shape can NEVER promote a TradFi instrument to CRYPTO.
+    """
+    up = str(symbol or "").upper()
+    return any(marker in up for marker in _VENUE_PAIR_MARKERS)
 
 
 def canonical_symbol(symbol: str) -> str:
@@ -55,7 +98,7 @@ def canonical_symbol(symbol: str) -> str:
     if not symbol:
         return symbol
     plain = str(symbol).upper().replace("/USDT", "").replace(":USDT", "").replace("USDT", "")
-    for prefix in (NCSI_PREFIX, NCSK_PREFIX, NCCO_PREFIX):
+    for prefix in (NCSI_PREFIX, NCSK_PREFIX, NCCO_PREFIX, NCFX_PREFIX):
         if plain.startswith(prefix):
             plain = plain[len(prefix):]
             break
@@ -65,23 +108,35 @@ def canonical_symbol(symbol: str) -> str:
 
 
 def classify(symbol: str, market: dict) -> tuple:
-    """Classify an instrument with confidence metadata.
+    """Classify an instrument with confidence metadata (FAIL-CLOSED).
 
     Returns (asset_class, source, confidence):
-      source = "metadata" | "pattern" | "unknown"
-      confidence in [0.0, 1.0]; asset_class = "UNKNOWN" when low.
+      source = "metadata" | "pattern" | "venue" | "unknown"
+      confidence in [0.0, 1.0]; asset_class = "UNKNOWN" when no exchange-grounded
+      evidence exists. An instrument is NEVER "CRYPTO" solely because nothing
+      matched: a BingX TradFi family prefix (NCSK/NCSI/NCCO/NCFX) always wins,
+      and an unmatched TradFi/unknown shape fails closed to its real class or
+      "UNKNOWN" instead of silently hopping into the CRYPTO bucket.
     """
     text = _text(symbol, market)
     base = str(market.get("base", symbol)).upper().split("/")[0].replace("-USDT", "")
     info = market.get("info") or {}
     display = str(info.get("displayName", "")).upper()
     canon = canonical_symbol(symbol)
-    # 1. Metadata: canonical prefix → class, highest confidence
-    if base.startswith(NCSI_PREFIX):
-        return "INDEX", "metadata", 1.0
+    # 1. Metadata: venue family prefix → class, highest confidence
     if base.startswith(NCSK_PREFIX):
+        if any(t in display or t in canon for t in ETF_HINTS):
+            return "ETF", "metadata", 0.98
         return "STOCK", "metadata", 1.0
-    # 2. commodities/energy/gold/metal/oil — resolved against hint tables
+    if base.startswith(NCSI_PREFIX):
+        if any(t in display or t in canon for t in ETF_HINTS):
+            return "ETF", "metadata", 0.98
+        return "INDEX", "metadata", 1.0
+    if base.startswith(NCFX_PREFIX):
+        return "FOREX", "metadata", 1.0
+    # 2. commodities/energy/gold/metal/oil — venue family NCCO is a commodity
+    #    domain by definition; displayName/hints resolve the sub-class and it
+    #    can never fall through to CRYPTO.
     if base.startswith(NCCO_PREFIX):
         if any(h in text for h in GOLD_HINTS):
             return "GOLD", "metadata", 0.95
@@ -91,6 +146,11 @@ def classify(symbol: str, market: dict) -> tuple:
             return "OIL", "metadata", 0.90
         if any(h in text for h in ENERGY_HINTS):
             return "ENERGY", "metadata", 0.90
+        # A venue-named fiat pair inside the commodity domain is still forex
+        # (the displayName is the exchange's own evidence, e.g. EURUSD).
+        if _is_fiat_pair(text, base):
+            return "FOREX", "metadata", 0.85
+        return "ENERGY", "metadata", 0.80
     # 3. Weak pattern fallback, lower confidence
     if any(h in text for h in GOLD_HINTS):
         return "GOLD", "pattern", 0.6
@@ -107,7 +167,16 @@ def classify(symbol: str, market: dict) -> tuple:
     if any(h in base for h in FOREX_HINTS) and (base.startswith(NCCO_PREFIX) or
                                               base.endswith(("AUD","EUR","CHF","GBP","JPY","CAD","NZD","USD"))):
         return "FOREX", "pattern", 0.55
-    return "CRYPTO", "pattern", 0.4
+    if any(t in text for t in ETF_HINTS):
+        return "ETF", "pattern", 0.6
+    # 4. Venue crypto: base issued by the venue (no TradFi family prefix).
+    #    Requires venue evidence: a real market base OR a margin-pair-shaped
+    #    symbol. Metadata-free / malformed shapes fall through to UNKNOWN.
+    if base and not base.startswith(VENUE_TRADFI_PREFIXES):
+        if market.get("base") or _venue_pair(symbol):
+            return "CRYPTO", "venue", 0.9
+    # 5. Fail closed: never a silent CRYPTO from an unknown/non-venue shape.
+    return "UNKNOWN", "unknown", 0.0
 
 
 def classify_legacy(symbol: str, market: dict) -> str:
