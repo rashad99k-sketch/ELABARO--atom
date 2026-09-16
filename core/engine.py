@@ -2888,11 +2888,12 @@ class AssetBehaviorProfile:
     @classmethod
     def resolve_asset_class(cls, symbol: str) -> str:
         """Best-effort asset classification from a symbol when portfolio context
-        is not available. Returns one of CRYPTO/INDEX/GOLD/OIL/STOCK."""
+        is not available. Returns one of CRYPTO/INDEX/GOLD/OIL/STOCK — or FOREX
+        for NCFX instruments (discovered, never opened: cap-0 fail-closed)."""
         try:
             from portfolio.manager import PortfolioManager
             ac = PortfolioManager._asset_class(symbol)
-            if ac and ac.upper() in cls.DEFAULT:
+            if ac and (ac.upper() in cls.DEFAULT or ac.upper() == "FOREX"):
                 return ac.upper()
         except Exception:
             pass
@@ -13291,6 +13292,11 @@ def promote_to_queue():
             early_formation=entry.get("early_formation", {}),
         )
         cand.roro_signal = bool(analysis.get("roro_signal", False))
+        # CLASSIFICATION COHERENCE: carry the watch entry's asset_class onto the
+        # queue candidate (deep_scanner seeds FOREX for NCFX instruments). The
+        # legacy default "CRYPTO" silently mislabeled NCFXGBP2CHF as CRYPTO in
+        # telemetry while the portfolio layer rejected it with FOREX_CAPACITY_FULL.
+        cand.asset_class = str((entry.get("asset_class") or "")).upper() or AssetBehaviorProfile.resolve_asset_class(sym)
         cand.ob_grade = str(analysis.get("ob_grade", "NONE"))
         cand.strong_ob_present = cand.ob_grade in ("A+", "A")
         cand.is_a_grade = bool(entry.get("a_grade_ready"))
@@ -13966,6 +13972,7 @@ class ExecutionCandidate:
         return {
             'symbol': self.symbol,
             'side': self.side,
+            'asset_class': self.asset_class,
             'entry_price': self.entry_price,
             'zone_low': self.zone_low,
             'zone_high': self.zone_high,
@@ -14988,6 +14995,8 @@ class InstitutionalRadar:
         cand.institutional_score = inst.get("score", 0)
         cand.institutional_status = inst.get("status", "NEUTRAL")
         cand.institutional_layers = inst.get("details", {})
+        inherited_ac = cand.asset_class
+        cand.asset_class = str((entry.get("asset_class") or "")).upper() or inherited_ac or AssetBehaviorProfile.resolve_asset_class(symbol)
         cand.institutional_acceleration = entry.get("institutional_acceleration", 0)
         cand.pre_institutional_state = entry.get("pre_institutional_state", "PRE_ENTRY_READY")
         news = entry.get("news", {})

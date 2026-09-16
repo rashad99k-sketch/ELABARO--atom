@@ -102,14 +102,22 @@ class PortfolioManager:
         text = str(symbol or "").upper()
         # Canonical tradfi prefix classification (single source of truth:
         # scanner.universe.classify): NCSK->STOCK, NCSI->INDEX, NCCO->
-        # GOLD/OIL/METAL/ENERGY. Only metadata-confidence prefix hits are routed
-        # through the canonical classifier; every other symbol keeps the legacy
-        # hint behaviour below so CRYPTO remains the safe fallback.
-        if text.split("/")[0].startswith(("NCSI", "NCSK", "NCCO")):
+        # GOLD/OIL/METAL/ENERGY, NCFX->FOREX. Only metadata-confidence prefix
+        # hits are routed through the canonical classifier, EXCEPT the NCFX
+        # forex prefix: those symbols classify as FOREX via the venue's
+        # currency-pair pattern (universe returns ("FOREX","pattern",0.55)),
+        # and FOREX is a permanently unsupported bucket (cap 0, fail-closed),
+        # so a pattern-classified FOREX is accepted for the NCFX prefix to keep
+        # the manager's class consistent with the universe/allocator. Every
+        # other symbol keeps the legacy hint behaviour below so CRYPTO remains
+        # the safe fallback.
+        if text.split("/")[0].startswith(("NCSI", "NCSK", "NCCO", "NCFX")):
             try:
                 from scanner.universe import classify
                 _ac, _src, _conf = classify(str(symbol or ""), {})
                 if _src == "metadata" and _ac:
+                    return _ac
+                if text.split("/")[0].startswith("NCFX") and _ac == "FOREX":
                     return _ac
             except Exception:
                 pass

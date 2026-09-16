@@ -414,19 +414,26 @@ def _classify_open_failure(symbol, side: str, exec_pipe: dict,
 def _record_open_attempt(exec_pipe: dict, *, symbol="", asset_class="", bucket="",
                          lifecycle_state="READY", portfolio_capacity_result="",
                          rejection_reason="", rejection_category="",
-                         next_queue_action="") -> None:
+                         next_queue_action="", raw_asset_class="") -> None:
     """Deterministic per-OPEN_REQUESTED-attempt telemetry ring (bounded).
 
     Every READY candidate offered to the allocation/execution path appends one
     structured record so the dashboard can show, per symbol, exactly where it
     died and what the queue did next — instead of only aggregate counters.
     Never raises; pure accounting.
+
+    Classification is recorded at BOTH layers when they legitimately differ:
+    `raw_asset_class` is the watch/scanner-seeded class (e.g. deep_scanner
+    writes FOREX for NCFX symbols) and `asset_class` is the class the layer
+    actually used (allocator decision class / candidate class), so a
+    split-brain (raw FOREX vs used CRYPTO) is never silently hidden.
     """
     try:
         _attempts = exec_pipe.setdefault("open_attempts", [])
         _attempts.append({
             "symbol": str(symbol or ""),
             "asset_class": str(asset_class or ""),
+            "raw_asset_class": str(raw_asset_class or ""),
             "bucket": str(bucket or ""),
             "lifecycle_state": str(lifecycle_state or "READY"),
             "portfolio_capacity_result": str(portfolio_capacity_result or ""),
@@ -468,6 +475,11 @@ def _execute_ready_queue_candidate():
         "NEWS_CAP": "NEWS_SLOT_FULL",
         "INDEX_STOCK_CAP": "INDEX_STOCK_CAPACITY_FULL",
         "COMMODITY_CAP": "COMMODITY_CAPACITY_FULL",
+        # NCFX forex instruments classify as FOREX (universe pattern) and FOREX
+        # has a permanently-0 capacity bucket (discovered, never opened), so the
+        # allocator's FOREX_CAP maps to the same explicit user-facing blocker
+        # the portfolio layer reports (FOREX_CAPACITY_FULL).
+        "FOREX_CAP": "FOREX_CAPACITY_FULL",
     }
 
     exec_pipe = MEMORY.setdefault("pipeline", {}).setdefault("execution", {})
@@ -559,6 +571,18 @@ def _execute_ready_queue_candidate():
                                 f"news_risk={news_risk:.0f}", best.side)
             return False
 
+        # CLASSIFICATION COHERENCE: prefer the watch-stored explicit class when
+        # present (deep_scanner writes FOREX for NCFX symbols); otherwise derive
+        # from the symbol via PortfolioManager (which routes the NCFX forex
+        # prefix to FOREX), NEVER a silent hardcoded "CRYPTO" fallback — that
+        # default let an NCFX instrument (asset_class=FOREX) be classified as
+        # CRYPTO by the allocator while the portfolio layer rejected it with
+        # FOREX_CAPACITY_FULL (the split-brain this file reproduces).
+        _cand_ac = ""
+        if isinstance(watch, dict) and str(watch.get("asset_class") or ""):
+            _cand_ac = str(watch.get("asset_class")).upper()
+        else:
+            _cand_ac = PORTFOLIO._asset_class(best.symbol)
         candidate = {
             "symbol": best.symbol,
             "side": best.side,
@@ -569,7 +593,7 @@ def _execute_ready_queue_candidate():
             "score": best.priority_score,
             "atr": best.atr,
             "scenario": best.opportunity_type.value,
-            "asset_class": watch.get("asset_class", "CRYPTO") if isinstance(watch, dict) else "CRYPTO",
+            "asset_class": _cand_ac,
             "news": watch.get("news", {}) if isinstance(watch, dict) else {},
             "trade_id": getattr(best, "trade_id", "") or getattr(best, "candidate_id", ""),
             "trade_type": getattr(best, "trade_type", "TREND"),
@@ -654,6 +678,7 @@ def _execute_ready_queue_candidate():
                         exec_pipe,
                         symbol=candidate["symbol"],
                         asset_class=decision.asset_class,
+                        raw_asset_class=candidate.get("asset_class", ""),
                         bucket=decision.bucket,
                         lifecycle_state=getattr(best, "state", None).value if getattr(best, "state", None) is not None else "READY",
                         portfolio_capacity_result=f"{decision.reason} ({_reason_user}) "
@@ -700,6 +725,7 @@ def _execute_ready_queue_candidate():
                 exec_pipe,
                 symbol=best.symbol,
                 asset_class=best.asset_class,
+                raw_asset_class=_cand_ac,
                 bucket="",
                 lifecycle_state="EXECUTED",
                 portfolio_capacity_result="ALLOWED (executed)",
@@ -710,16 +736,40 @@ def _execute_ready_queue_candidate():
             return True
         _exec_gate("open_candidate_failed")
         _classify_open_failure(best.symbol, best.side, exec_pipe)
+        # QUEUE ADVANCE for open_candidate_failed capacity rejections. A
+        # deterministic capacity blocker (FOREX_CAPACITY_FULL, TOTAL,
+        # TECHNICAL, NEWS_SLOT, <bucket>_CAPACITY_FULL) must NOT re-pick the
+        # same highest-READY candidate every cycle forever. Mirror the
+        # allocator-reject branch: back off so the queue advances to the next
+        # eligible candidate (a free CRYPTO/OIL/GOLD/NEWS seat). Non-capacity
+        # failures (RISK, ADX, liquidity, execution) keep retry_next_cycle —
+        # they are transient and must not be masked.
+        _oa_cat = exec_pipe.get("last_open_failure_category", "other")
+        _oa_is_capacity = _oa_cat in ("capacity", "news_capacity",
+                                      "total_capacity", "technical_capacity")
+        if _oa_is_capacity:
+            try:
+                _bsoff = float(os.getenv("QUEUE_ALLOCATOR_BACKOFF_SEC", "300"))
+                _kand = queue._candidates.get(best.symbol)
+                if _kand is not None:
+                    _kand.allocator_rejected_until = time.time() + _bsoff
+                    _kand.last_allocator_reason = str(exec_pipe.get("last_open_failure_blocker", "CAPACITY"))
+                    _kand.last_allocator_reason_user = str(exec_pipe.get("last_open_failure_blocker", "CAPACITY"))
+            except Exception:
+                pass
+        _oa_next = "backoff+advance_queue" if _oa_is_capacity else "retry_next_cycle"
+        _watch_ac = watch.get("asset_class") if isinstance(watch, dict) else ""
         _record_open_attempt(
             exec_pipe,
             symbol=best.symbol,
             asset_class=getattr(best, "asset_class", ""),
+            raw_asset_class=str(_watch_ac or ""),
             bucket="",
             lifecycle_state=getattr(best, "state", None).value if getattr(best, "state", None) is not None else "READY",
             portfolio_capacity_result="PORTFOLIO/open_candidate rejected",
             rejection_reason=exec_pipe.get("last_open_failure_blocker", "UNKNOWN"),
-            rejection_category=exec_pipe.get("last_open_failure_category", "other"),
-            next_queue_action="retry_next_cycle",
+            rejection_category=_oa_cat,
+            next_queue_action=_oa_next,
         )
     except Exception as exc:
         log_execution(f"[QUEUE] ready execution error: {exc}", "ERROR")

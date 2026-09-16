@@ -115,16 +115,20 @@ PRICES = {
     "XAUUSD": 2300.0,
     "OIL/USDT:USDT": 80.0,
     "NCSKNVDA2USD/USDT:USDT": 130.0,
+    "NCFXGBP2CHF/USDT:USDT": 1.3,
+    "SOL/USDT:USDT": 150.0,
 }
 
 CLASS_BY_SYMBOL = {
     "BTC/USDT:USDT": "CRYPTO",
     "ETH/USDT:USDT": "CRYPTO",
+    "SOL/USDT:USDT": "CRYPTO",
     "US500/USDT:USDT": "INDEX",
     "USTECH/USDT:USDT": "INDEX",
     "NCSKAAPL2USD/USDT:USDT": "STOCK",
     "XAUUSD": "GOLD",
     "OIL/USDT:USDT": "OIL",
+    "NCFXGBP2CHF/USDT:USDT": "FOREX",
 }
 
 READY_FLOORS = {
@@ -133,6 +137,7 @@ READY_FLOORS = {
     "STOCK": 67.0,
     "GOLD": 68.0,
     "OIL": 68.0,
+    "FOREX": 68.0,
 }
 
 
@@ -426,3 +431,227 @@ class AllocatorReadyExecutionFixTest(unittest.TestCase):
         self.assertTrue(RT._execute_ready_queue_candidate(),
                         "GOLD must open after backoff; queue must advance")
         self.assertEqual(RT.PORTFOLIO.count(), 5)
+
+    # ---- 5. NCFX forex classification: FOREX, not CRYPTO (split-brain fix) ----
+    def test_ncfx_forex_classification_manager_symbol(self):
+        """PortfolioManager._asset_class must classify the NCFX forex prefix as
+        FOREX (venue currency-pair pattern, cap-0 fail-closed bucket) instead of
+        the legacy CRYPTO fallback. This is the classification-layer root cause
+        of the NCFXGBP2CHF split-brain (watch FOREX vs allocator CRYPTO)."""
+        RT = self.RT
+        symbol = "NCFXGBP2CHF/USDT:USDT"
+        self.assertEqual(RT.PORTFOLIO._asset_class(symbol), "FOREX")
+        self.assertEqual(RT.PORTFOLIO._asset_class(symbol, "FOREX"), "FOREX")
+        # The allocator's symbol-only derivation agrees with the explicit class.
+        from portfolio.allocator import bucket_of, bucket_cap
+        self.assertEqual(bucket_of("FOREX"), "FOREX")
+        self.assertEqual(bucket_cap("FOREX"), 0)
+
+    def test_ncfx_forex_universe_and_resolve_classification(self):
+        """Universe classify + AssetBehaviorProfile.resolve_asset_class must
+        agree on FOREX for NCFX instruments so no layer silently relabels them
+        CRYPTO (the pre-fix behaviour that made telemetry lie and the allocator
+        first-allow then the portfolio FOREX_CAPACITY_FULL-reject)."""
+        E = self.RT.E
+        from scanner import universe as U
+        symbol = "NCFXGBP2CHF/USDT:USDT"
+        cls, src, conf = U.classify(symbol, {})
+        self.assertEqual(cls, "FOREX")
+        self.assertEqual(src, "pattern")
+        self.assertGreaterEqual(conf, 0.5)
+        self.assertEqual(E.AssetBehaviorProfile.resolve_asset_class(symbol), "FOREX")
+
+    def test_ncfx_forex_rejection_reason_for_capacity_full(self):
+        """An NCFX instrument must be refused with the explicit FOREX bucket
+        (cap 0) and surfaced as FOREX_CAP -> user FOREX_CAPACITY_FULL, category
+        capacity — the allocator now rejects at the allocator exactly like a
+        filled bucket, instead of the portfolio layer reporting
+        FOREX_CAPACITY_FULL while telemetry said asset_class=CRYPTO."""
+        RT = self.RT
+        self._ready_candidate("NCFXGBP2CHF/USDT:USDT", score=95.0)
+        # A gold candidate exists; it must NOT be starved by the blocked FOREX.
+        self._ready_candidate("XAUUSD", score=60.0)
+        self.assertFalse(RT._execute_ready_queue_candidate(),
+                         "FOREX cap-0 candidate must be rejected")
+        exec_pipe = self._exec_pipe()
+        self.assertEqual(exec_pipe.get("last_outcome"), "allocator_reject")
+        self.assertEqual(exec_pipe.get("last_reject_reason"), "FOREX_CAP")
+        self.assertEqual(exec_pipe.get("last_reject_reason_user"),
+                         "FOREX_CAPACITY_FULL")
+        self.assertEqual(exec_pipe.get("last_reject_asset_class"), "FOREX")
+        self.assertEqual(exec_pipe.get("last_reject_bucket"), "FOREX")
+        self.assertEqual(exec_pipe.get("last_reject_bucket_used"), 0)
+        self.assertEqual(exec_pipe.get("last_reject_bucket_max"), 0)
+        # Failure taxonomy: identical to any filled bucket (never UNKNOWN).
+        self.assertEqual(exec_pipe.get("last_open_failure_category"), "capacity")
+        self.assertEqual(exec_pipe.get("last_open_failure_blocker"),
+                         "FOREX_CAPACITY_FULL")
+        self.assertNotIn("NCFXGBP2CHF/USDT:USDT", RT.PORTFOLIO.symbols())
+
+    def test_ncfx_forex_rejection_not_retry_next_cycle(self):
+        """A capacity-rejected FOREX candidate must NOT take the retry_next_cycle
+        path (the pre-fix starvation behaviour): the open_attempt telemetry ring
+        records backoff+advance_queue and the candidate is allocator-backed-off
+        so the queue moves on to the next eligible instrument."""
+        RT = self.RT
+        self._ready_candidate("NCFXGBP2CHF/USDT:USDT", score=95.0)
+        self._ready_candidate("XAUUSD", score=60.0)
+        self.assertFalse(RT._execute_ready_queue_candidate())
+        exec_pipe = self._exec_pipe()
+        last = exec_pipe.get("last_open_attempt")
+        self.assertIsNotNone(last)
+        self.assertEqual(last["symbol"], "NCFXGBP2CHF/USDT:USDT")
+        self.assertEqual(last["asset_class"], "FOREX")
+        self.assertEqual(last["raw_asset_class"], "FOREX")
+        self.assertEqual(last["bucket"], "FOREX")
+        self.assertEqual(last["rejection_reason"], "FOREX_CAP")
+        self.assertEqual(last["rejection_category"], "capacity")
+        self.assertEqual(last["next_queue_action"], "backoff+advance_queue")
+        cand = RT.queue._candidates.get("NCFXGBP2CHF/USDT:USDT")
+        self.assertIsNotNone(cand)
+        self.assertGreater(cand.allocator_rejected_until, time.time())
+        self.assertEqual(cand.last_allocator_reason, "FOREX_CAP")
+        self.assertEqual(cand.last_allocator_reason_user, "FOREX_CAPACITY_FULL")
+
+    def test_ncfx_forex_not_repicked_as_highest_ready(self):
+        """After the FOREX capacity rejection, the queue must NOT re-pick the
+        same permanently blocked NCFX candidate as best on the next cycle."""
+        RT = self.RT
+        self._ready_candidate("NCFXGBP2CHF/USDT:USDT", score=95.0)
+        self._ready_candidate("XAUUSD", score=60.0)
+        self.assertFalse(RT._execute_ready_queue_candidate())
+        best = RT.queue.get_best_candidate()
+        self.assertIsNotNone(best)
+        self.assertEqual(best.symbol, "XAUUSD",
+                         "blocked FOREX must not remain the best READY candidate")
+
+    def test_ncfx_forex_rejection_advances_to_gold(self):
+        """The whole point of the fix: a permanently FOREX-blocked NCFX
+        candidate no longer starves the queue — the next eligible instrument
+        (GOLD, one free commodity seat) must open right after the rejection
+        without any manual invalidation."""
+        RT = self.RT
+        self._ready_candidate("NCFXGBP2CHF/USDT:USDT", score=95.0)
+        self._ready_candidate("XAUUSD", score=85.0)
+        self.assertFalse(RT._execute_ready_queue_candidate())
+        self.assertEqual(RT.PORTFOLIO.count(), 0)
+        self.assertTrue(RT._execute_ready_queue_candidate(),
+                        "GOLD must open after the FOREX rejection advanced the queue")
+        self.assertEqual(RT.PORTFOLIO.count(), 1)
+        classes = [ctx.asset_class for ctx in RT.PORTFOLIO.contexts.values()]
+        self.assertEqual(classes, ["GOLD"])
+
+    # ---- 6. Capacity full: CRYPTO / INDEX/STOCK / commodity / total / news ----
+    def test_crypto_capacity_full_classified(self):
+        """3rd CRYPTO candidate (2 live) is refused at the allocator as
+        CRYPTO_CAP -> user CRYPTO_SLOT_FULL, category capacity."""
+        RT = self.RT
+        for sym in ["BTC/USDT:USDT", "ETH/USDT:USDT"]:
+            self._ready_candidate(sym)
+            self.assertTrue(RT._execute_ready_queue_candidate())
+        self.assertEqual(RT.PORTFOLIO.count(), 2)
+        self._ready_candidate("SOL/USDT:USDT")
+        self.assertFalse(RT._execute_ready_queue_candidate(),
+                         "3rd crypto must be rejected (bucket 2/2)")
+        exec_pipe = self._exec_pipe()
+        self.assertEqual(exec_pipe.get("last_reject_reason"), "CRYPTO_CAP")
+        self.assertEqual(exec_pipe.get("last_reject_reason_user"),
+                         "CRYPTO_SLOT_FULL")
+        self.assertEqual(exec_pipe.get("last_open_failure_category"), "capacity")
+        self.assertNotIn("SOL/USDT:USDT", RT.PORTFOLIO.symbols())
+
+    def test_index_stock_capacity_full_classified(self):
+        """3rd INDEX/STOCK candidate (2 live combined) is refused as
+        INDEX_STOCK_CAP -> INDEX_STOCK_CAPACITY_FULL, category capacity."""
+        RT = self.RT
+        for sym in ["US500/USDT:USDT", "USTECH/USDT:USDT", "NCSKAAPL2USD/USDT:USDT"]:
+            # only 2 of the combined bucket can be live; the third is the reject
+            self._ready_candidate(sym)
+            RT._execute_ready_queue_candidate()
+        self.assertEqual(RT.PORTFOLIO.count(), 2)
+        exec_pipe = self._exec_pipe()
+        self.assertEqual(exec_pipe.get("last_reject_reason"), "INDEX_STOCK_CAP")
+        self.assertEqual(exec_pipe.get("last_reject_reason_user"),
+                         "INDEX_STOCK_CAPACITY_FULL")
+        self.assertEqual(exec_pipe.get("last_open_failure_category"), "capacity")
+
+    def test_commodity_capacity_full_classified(self):
+        """2nd commodity candidate (GOLD live on the single OIL/GOLD seat) is
+        refused as COMMODITY_CAP -> COMMODITY_CAPACITY_FULL, category capacity."""
+        RT = self.RT
+        self._ready_candidate("XAUUSD")
+        self.assertTrue(RT._execute_ready_queue_candidate())
+        self._ready_candidate("OIL/USDT:USDT")
+        self.assertFalse(RT._execute_ready_queue_candidate(),
+                         "OIL after GOLD must be refused (single commodity seat)")
+        exec_pipe = self._exec_pipe()
+        self.assertEqual(exec_pipe.get("last_reject_reason"), "COMMODITY_CAP")
+        self.assertEqual(exec_pipe.get("last_reject_reason_user"),
+                         "COMMODITY_CAPACITY_FULL")
+        self.assertEqual(exec_pipe.get("last_open_failure_category"), "capacity")
+        self.assertNotIn("OIL/USDT:USDT", RT.PORTFOLIO.symbols())
+
+    def test_total_portfolio_capacity_full_classified(self):
+        """7th position (5 technical + 1 news live) -> SLOT_CAP ->
+        TOTAL_PORTFOLIO_CAPACITY_FULL, category capacity, never UNKNOWN."""
+        RT = self.RT
+        for sym in ["BTC/USDT:USDT", "ETH/USDT:USDT",
+                    "NCSKAAPL2USD/USDT:USDT", "US500/USDT:USDT", "XAUUSD"]:
+            self._ready_candidate(sym)
+            self.assertTrue(RT._execute_ready_queue_candidate())
+        self._news_watch()
+        self.assertTrue(RT.execute_news_slot(), "news slot opens (6th seat)")
+        self.assertEqual(RT.PORTFOLIO.count(), 6)
+        self._ready_candidate("OIL/USDT:USDT")
+        self.assertFalse(RT._execute_ready_queue_candidate(),
+                         "7th position must be refused (TOTAL=6 full)")
+        exec_pipe = self._exec_pipe()
+        self.assertEqual(exec_pipe.get("last_outcome"), "no_slots")
+        self.assertEqual(exec_pipe.get("last_reject_reason"), "SLOT_CAP")
+        self.assertEqual(exec_pipe.get("last_reject_reason_user"),
+                         "TOTAL_PORTFOLIO_CAPACITY_FULL")
+        self.assertEqual(exec_pipe.get("last_open_failure_category"), "capacity")
+
+    def test_news_slot_independent_of_forex_blocked_technical(self):
+        """The independent NEWS slot (1 seat on top of 5 technical) must open
+        even while an NCFX FOREX candidate is blocked and a technical slot is
+        free — proving the NEWS slot does not couple to bucket capacity."""
+        RT = self.RT
+        # Blocked FOREX candidate sits in the queue; technical seats stay free.
+        self._ready_candidate("NCFXGBP2CHF/USDT:USDT", score=95.0)
+        self.assertFalse(RT._execute_ready_queue_candidate(),
+                         "FOREX cap-0 candidate must be rejected")
+        self.assertEqual(RT.PORTFOLIO.count(), 0)
+        self._news_watch()
+        self.assertTrue(RT.execute_news_slot(), "news slot must open")
+        self.assertEqual(self._exec_pipe().get("news_executed"), 1)
+        self.assertEqual(RT.PORTFOLIO.count(), 1)
+        # NEWS #2 is refused, slot is a singleton.
+        self.assertFalse(RT.execute_news_slot())
+        self.assertEqual(self._exec_pipe().get("last_outcome"), "news_slot_full")
+        self.assertEqual(self._exec_pipe().get("last_reject_reason_user"),
+                         "NEWS_SLOT_FULL")
+
+    def test_no_known_allocator_rejection_classified_unknown(self):
+        """No rejection in the capacity taxonomy may ever surface as UNKNOWN:
+        every known allocator token (capacity buckets + SLOT_CAP + NEWS_SLOT_FULL)
+        must classify into a named category with a non-NONE user blocker."""
+        RT = self.RT
+        # Trigger a FOREX_CAP reject.
+        self._ready_candidate("NCFXGBP2CHF/USDT:USDT", score=95.0)
+        self._ready_candidate("XAUUSD", score=60.0)
+        RT._execute_ready_queue_candidate()
+        exec_pipe = self._exec_pipe()
+        self.assertEqual(exec_pipe.get("last_open_failure_blocker"),
+                         "FOREX_CAPACITY_FULL")
+        self.assertNotEqual(exec_pipe.get("last_open_failure_blocker"), "UNKNOWN")
+        self.assertEqual(exec_pipe.get("open_failure_category:unknown", 0), 0)
+        # INDEX_STOCK_CAP reject too.
+        for sym in ["US500/USDT:USDT", "USTECH/USDT:USDT", "NCSKAAPL2USD/USDT:USDT"]:
+            self._ready_candidate(sym)
+            RT._execute_ready_queue_candidate()
+        exec_pipe = self._exec_pipe()
+        self.assertEqual(exec_pipe.get("last_open_failure_blocker"),
+                         "INDEX_STOCK_CAPACITY_FULL")
+        self.assertNotEqual(exec_pipe.get("last_open_failure_blocker"), "UNKNOWN")
+        self.assertEqual(exec_pipe.get("open_failure_category:unknown", 0), 0)
