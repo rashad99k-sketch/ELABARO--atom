@@ -5242,128 +5242,197 @@ class LiveTradeManager:
 
         ob = copy.deepcopy(STATE.get("order_block")) if isinstance(STATE.get("order_block"), dict) else None
 
+        _mgmt_cycle = getattr(self, "_management_cycle_id", 0) + 1
+        self._management_cycle_id = _mgmt_cycle
+        _tid = STATE.get("trade_id") or "UNKNOWN"
+
         if now - self.last_heavy_calc_ts >= 5:
-            plus_di, minus_di, adx_now, adx_slope = get_di_components(df_live)
-            if plus_di is None: plus_di = 20.0
-            if minus_di is None: minus_di = 20.0
-            if adx_now is None: adx_now = 20.0
-            if adx_slope is None: adx_slope = 0.0
-
-            pullback_type = trend_engine.analyze_pullback(df_live, side, atr)
-            weak_pullback = (pullback_type == "WEAK_PULLBACK")
-            counter_displacement = 0.0
-            last_candle = df_live.iloc[-1]
-            if side == "SELL" and last_candle['close'] > last_candle['open']:
-                body = abs(last_candle['close'] - last_candle['open'])
-                if body > atr * 0.6:
-                    counter_displacement = body / atr
-            elif side == "BUY" and last_candle['close'] < last_candle['open']:
-                body = abs(last_candle['close'] - last_candle['open'])
-                if body > atr * 0.6:
-                    counter_displacement = body / atr
-            volume_ratio = df_live['volume'].iloc[-1] / df_live['volume'].iloc[-10:-1].mean() if len(df_live) >= 10 else 1.0
-            trend_health = trend_engine.get_trend_health(df_live, side)
-            struct_shift = detect_structure_shift(df_live)
-            structure_aligned = (side == "BUY" and struct_shift == "bullish_shift") or (side == "SELL" and struct_shift == "bearish_shift")
-            market_state = {
-                "atr": atr,
-                "adx": adx_now,
-                "adx_slope": adx_slope,
-                "di_plus": plus_di,
-                "di_minus": minus_di,
-                "trend_health": trend_health,
-                "weak_pullback": weak_pullback,
-                "counter_displacement": counter_displacement,
-                "volume_ratio": volume_ratio,
-                "df": df_live,
-                "last_candle": last_candle,
-                "structure_aligned": structure_aligned,
-                "continuation_pressure": 50,
-                "vpa": STATE.get("position_vpa", {})
-            }
-
-            smart_money = SmartMoneyEngine.analyze_smart_money(df_live)
-            momentum = MomentumFlowEngine.analyze_momentum_flow(df_live)
-
-            regime = self.regime_classifier.classify(df_live, ob)
-            trade_state = self.brain.update(smart_money, momentum, adx_now, regime)
-            STATE["trade_state"] = trade_state
-            STATE["smart_trail_mult"] = self.brain.get_trail_multiplier()
-            STATE["delay_tp1"] = self.brain.should_delay_tp1()
-            STATE["adx_live"] = adx_now
-            STATE["di_plus_live"] = plus_di
-            STATE["di_minus_live"] = minus_di
-            STATE["smart_money"] = smart_money
-            STATE["momentum_flow"] = momentum
-            STATE["market_regime"] = regime
-
-            # ---- Phase-3 (G2/G7): advisory signal stack ----
-            # RSI / MACD-histogram / volume-regime / VWAP context plus the
-            # live OB-zone strength feed the advisory health and the dynamic
-            # rules. They are PERSISTED into STATE so the non-heavy path reuses
-            # the same values (recomputed only every 5s like the rest).
             try:
-                STATE["position_rsi"] = float(compute_rsi(df_live).iloc[-1])
-            except Exception:
-                STATE.setdefault("position_rsi", 50.0)
-            try:
-                _, _, macd_hist = compute_macd(df_live)
-                STATE["position_macd_hist"] = float(macd_hist.iloc[-1])
-            except Exception:
-                STATE.setdefault("position_macd_hist", 0.0)
-            try:
-                STATE["position_vol_state"] = classify_volume(df_live)
-            except Exception:
-                STATE.setdefault("position_vol_state", "NORMAL")
-            try:
-                vw = vwap_features(df_live)
-                STATE["position_vwap_dist"] = float(vw.get("distance", 0.0))
-                STATE["position_vwap_slope"] = float(vw.get("slope", 0.0))
-            except Exception:
-                STATE.setdefault("position_vwap_dist", 0.0)
-                STATE.setdefault("position_vwap_slope", 0.0)
-            try:
-                zmap = get_smart_zones(STATE["current_symbol"], df_live, None)
-                zstock = (zmap.get("sell_zones") if side == "SELL" else zmap.get("buy_zones")) or []
-                if zstock and float(zstock[0].get("strength", 0) or 0) > 0:
-                    STATE["zone_strength_score"] = float(min(100.0, max(0.0, float(zstock[0]["strength"]) * 10.0)))
-                if _setup_snapshot.get("zone_low") and _setup_snapshot.get("zone_high"):
-                    STATE["zone_info"] = copy.deepcopy(_setup_snapshot.get("zone"))
-                    STATE["zone"] = copy.deepcopy(STATE.get("zone_info"))
-                    STATE["zone_low"] = float(_setup_snapshot["zone_low"])
-                    STATE["zone_high"] = float(_setup_snapshot["zone_high"])
-                    STATE["order_block"] = copy.deepcopy(_setup_snapshot.get("order_block"))
-                    STATE["ob_grade"] = _setup_snapshot.get("ob_grade", STATE.get("ob_grade", "NONE"))
-                    STATE["management_zone_source"] = "ENTRY_CAUSAL_SNAPSHOT"
-            except Exception:
-                STATE.setdefault("zone_strength_score", 0.0)
-            # VPA is a position-thesis evidence layer. It can corroborate a
-            # failure, but volume alone is never allowed to close a healthy trend.
-            try:
-                _zlo = STATE.get("zone_low", 0.0) or None
-                _zhi = STATE.get("zone_high", 0.0) or None
-                STATE["position_vpa"] = analyze_vpa(
-                    df_live, side, zone_low=_zlo, zone_high=_zhi, atr=atr
-                ) if analyze_vpa is not None else {}
-            except Exception:
-                STATE.setdefault("position_vpa", {})
-            # IFVG warning payload for the live position (warning-only engine).
-            STATE["ifvg_state"] = ifvg_warning_payload(side, df_live, atr, mark_price)
+                plus_di, minus_di, adx_now, adx_slope = get_di_components(df_live)
+                if plus_di is None: plus_di = 20.0
+                if minus_di is None: minus_di = 20.0
+                if adx_now is None: adx_now = 20.0
+                if adx_slope is None: adx_slope = 0.0
 
-            thesis_dict = STATE.get("trade_thesis", {})
-            cont_pressure_score, cont_pressure_reasons = self.continuation_pressure_engine.calculate_pressure(df_live, side, entry, atr, STATE.get("entry_time", time.time()))
-            market_state["continuation_pressure"] = cont_pressure_score
-            continuation_eval = _continuation_engine.evaluate(side, df_live, market_state, thesis_dict)
-            STATE["continuation_probability"] = continuation_eval.continuation_probability
-            STATE["hold_quality"] = continuation_eval.hold_quality
-            STATE["counter_pressure"] = continuation_eval.counter_pressure
-            STATE["reclaim_risk"] = continuation_eval.reclaim_risk
-            STATE["trend_strength"] = continuation_eval.trend_strength
-            STATE["continuation_reasons"] = continuation_eval.reasons
-            STATE["continuation_pressure"] = cont_pressure_score
+                pullback_type = trend_engine.analyze_pullback(df_live, side, atr)
+                weak_pullback = (pullback_type == "WEAK_PULLBACK")
+                counter_displacement = 0.0
+                last_candle = df_live.iloc[-1]
+                if side == "SELL" and last_candle['close'] > last_candle['open']:
+                    body = abs(last_candle['close'] - last_candle['open'])
+                    if body > atr * 0.6:
+                        counter_displacement = body / atr
+                elif side == "BUY" and last_candle['close'] < last_candle['open']:
+                    body = abs(last_candle['close'] - last_candle['open'])
+                    if body > atr * 0.6:
+                        counter_displacement = body / atr
+                volume_ratio = df_live['volume'].iloc[-1] / df_live['volume'].iloc[-10:-1].mean() if len(df_live) >= 10 else 1.0
+                trend_health = trend_engine.get_trend_health(df_live, side)
+                struct_shift = detect_structure_shift(df_live)
+                structure_aligned = (side == "BUY" and struct_shift == "bullish_shift") or (side == "SELL" and struct_shift == "bearish_shift")
+                market_state = {
+                    "atr": atr,
+                    "adx": adx_now,
+                    "adx_slope": adx_slope,
+                    "di_plus": plus_di,
+                    "di_minus": minus_di,
+                    "trend_health": trend_health,
+                    "weak_pullback": weak_pullback,
+                    "counter_displacement": counter_displacement,
+                    "volume_ratio": volume_ratio,
+                    "df": df_live,
+                    "last_candle": last_candle,
+                    "structure_aligned": structure_aligned,
+                    "continuation_pressure": 50,
+                    "vpa": STATE.get("position_vpa", {})
+                }
 
-            failed, failure_reasons, failure_score = self.thesis_failure_engine.evaluate_failure(thesis_dict, market_state, mark_price, entry, side)
-            STATE["thesis_failure_score"] = failure_score
+                smart_money = SmartMoneyEngine.analyze_smart_money(df_live)
+                momentum = MomentumFlowEngine.analyze_momentum_flow(df_live)
+
+                regime = self.regime_classifier.classify(df_live, ob)
+                trade_state = self.brain.update(smart_money, momentum, adx_now, regime)
+                STATE["trade_state"] = trade_state
+                STATE["smart_trail_mult"] = self.brain.get_trail_multiplier()
+                STATE["delay_tp1"] = self.brain.should_delay_tp1()
+                STATE["adx_live"] = adx_now
+                STATE["di_plus_live"] = plus_di
+                STATE["di_minus_live"] = minus_di
+                STATE["smart_money"] = smart_money
+                STATE["momentum_flow"] = momentum
+                STATE["market_regime"] = regime
+
+                # ---- Phase-3 (G2/G7): advisory signal stack ----
+                # RSI / MACD-histogram / volume-regime / VWAP context plus the
+                # live OB-zone strength feed the advisory health and the dynamic
+                # rules. They are PERSISTED into STATE so the non-heavy path reuses
+                # the same values (recomputed only every 5s like the rest).
+                try:
+                    STATE["position_rsi"] = float(compute_rsi(df_live).iloc[-1])
+                except Exception:
+                    STATE.setdefault("position_rsi", 50.0)
+                try:
+                    _, _, macd_hist = compute_macd(df_live)
+                    STATE["position_macd_hist"] = float(macd_hist.iloc[-1])
+                except Exception:
+                    STATE.setdefault("position_macd_hist", 0.0)
+                try:
+                    STATE["position_vol_state"] = classify_volume(df_live)
+                except Exception:
+                    STATE.setdefault("position_vol_state", "NORMAL")
+                try:
+                    vw = vwap_features(df_live)
+                    STATE["position_vwap_dist"] = float(vw.get("distance", 0.0))
+                    STATE["position_vwap_slope"] = float(vw.get("slope", 0.0))
+                except Exception:
+                    STATE.setdefault("position_vwap_dist", 0.0)
+                    STATE.setdefault("position_vwap_slope", 0.0)
+                try:
+                    zmap = get_smart_zones(STATE["current_symbol"], df_live, None)
+                    zstock = (zmap.get("sell_zones") if side == "SELL" else zmap.get("buy_zones")) or []
+                    if zstock and float(zstock[0].get("strength", 0) or 0) > 0:
+                        STATE["zone_strength_score"] = float(min(100.0, max(0.0, float(zstock[0]["strength"]) * 10.0)))
+                    if _setup_snapshot.get("zone_low") and _setup_snapshot.get("zone_high"):
+                        STATE["zone_info"] = copy.deepcopy(_setup_snapshot.get("zone"))
+                        STATE["zone"] = copy.deepcopy(STATE.get("zone_info"))
+                        STATE["zone_low"] = float(_setup_snapshot["zone_low"])
+                        STATE["zone_high"] = float(_setup_snapshot["zone_high"])
+                        STATE["order_block"] = copy.deepcopy(_setup_snapshot.get("order_block"))
+                        STATE["ob_grade"] = _setup_snapshot.get("ob_grade", STATE.get("ob_grade", "NONE"))
+                        STATE["management_zone_source"] = "ENTRY_CAUSAL_SNAPSHOT"
+                except Exception:
+                    STATE.setdefault("zone_strength_score", 0.0)
+                # VPA is a position-thesis evidence layer. It can corroborate a
+                # failure, but volume alone is never allowed to close a healthy trend.
+                try:
+                    _zlo = STATE.get("zone_low", 0.0) or None
+                    _zhi = STATE.get("zone_high", 0.0) or None
+                    STATE["position_vpa"] = analyze_vpa(
+                        df_live, side, zone_low=_zlo, zone_high=_zhi, atr=atr
+                    ) if analyze_vpa is not None else {}
+                except Exception:
+                    STATE.setdefault("position_vpa", {})
+                # IFVG warning payload for the live position (warning-only engine).
+                STATE["ifvg_state"] = ifvg_warning_payload(side, df_live, atr, mark_price)
+
+                thesis_dict = STATE.get("trade_thesis", {})
+                cont_pressure_score, cont_pressure_reasons = self.continuation_pressure_engine.calculate_pressure(df_live, side, entry, atr, STATE.get("entry_time", time.time()))
+                market_state["continuation_pressure"] = cont_pressure_score
+                continuation_eval = _continuation_engine.evaluate(side, df_live, market_state, thesis_dict)
+                STATE["continuation_probability"] = continuation_eval.continuation_probability
+                STATE["hold_quality"] = continuation_eval.hold_quality
+                STATE["counter_pressure"] = continuation_eval.counter_pressure
+                STATE["reclaim_risk"] = continuation_eval.reclaim_risk
+                STATE["trend_strength"] = continuation_eval.trend_strength
+                STATE["continuation_reasons"] = continuation_eval.reasons
+                STATE["continuation_pressure"] = cont_pressure_score
+            except Exception as _phase1_err:
+                log_execution(
+                    f"[HEAVY_CALC] cycle={_mgmt_cycle} symbol={symbol} trade_id={_tid} "
+                    f"stage=PHASE1_CORE_ANALYTICS exc_type={type(_phase1_err).__name__} "
+                    f"exc={_phase1_err} ts={time.time():.3f}\n{traceback.format_exc()}",
+                    "WARN",
+                )
+                adx_now = STATE.get("adx_live", 20.0)
+                plus_di = STATE.get("di_plus_live", 20.0)
+                minus_di = STATE.get("di_minus_live", 20.0)
+                smart_money = STATE.get("smart_money", {})
+                momentum = STATE.get("momentum_flow", {})
+                trade_state = STATE.get("trade_state", "RANGE_CHOP")
+                trend_health = STATE.get("advisory_trend_health", 5.0)
+                struct_shift = STATE.get("advisory_struct_shift", None)
+                structure_aligned = STATE.get("advisory_structure_aligned", False)
+                continuation_eval = ContinuationEvaluation(
+                    continuation_probability=STATE.get("continuation_probability", 0.5),
+                    trend_strength=STATE.get("trend_strength", 0.5),
+                    exhaustion_probability=0.0,
+                    reclaim_risk=STATE.get("reclaim_risk", 0.0),
+                    counter_pressure=STATE.get("counter_pressure", 0.0),
+                    confidence=0.5,
+                    reasons=STATE.get("continuation_reasons", []),
+                    should_hold=STATE.get("continuation_probability", 0.5) >= 0.62,
+                    hold_quality=STATE.get("hold_quality", "UNKNOWN"),
+                )
+                tp1_hold_score = STATE.get("tp1_hold_score", 10)
+                exit_warning = STATE.get("exit_warning", 0)
+                cont_pressure_score = STATE.get("continuation_pressure", 50)
+                adx_slope = 0.0
+                di_spread_change = 0.0
+                failure_score = STATE.get("thesis_failure_score", 0)
+                thesis_dict = STATE.get("trade_thesis", {})
+                if not isinstance(thesis_dict, dict):
+                    thesis_dict = {}
+                market_state = {
+                    "atr": atr,
+                    "adx": adx_now,
+                    "adx_slope": adx_slope,
+                    "di_plus": plus_di,
+                    "di_minus": minus_di,
+                    "trend_health": trend_health,
+                    "weak_pullback": False,
+                    "counter_displacement": 0.0,
+                    "volume_ratio": 1.0,
+                    "df": df_live,
+                    "last_candle": df_live.iloc[-1] if isinstance(df_live, pd.DataFrame) and len(df_live) else {},
+                    "structure_aligned": structure_aligned,
+                    "continuation_pressure": cont_pressure_score,
+                    "vpa": STATE.get("position_vpa", {}),
+                }
+
+            try:
+                failed, failure_reasons, failure_score = self.thesis_failure_engine.evaluate_failure(thesis_dict, market_state, mark_price, entry, side)
+                STATE["thesis_failure_score"] = failure_score
+            except Exception as _phase2_err:
+                log_execution(
+                    f"[HEAVY_CALC] cycle={_mgmt_cycle} symbol={symbol} trade_id={_tid} "
+                    f"stage=PHASE2_THESIS_FAILURE exc_type={type(_phase2_err).__name__} "
+                    f"exc={_phase2_err} ts={time.time():.3f}\n{traceback.format_exc()}",
+                    "WARN",
+                )
+                failed = False
+                failure_reasons = []
+                failure_score = STATE.get("thesis_failure_score", 0)
+
             if failed:
                 log_execution(f"[THESIS_FAILURE] Thesis failed for {symbol}: {failure_reasons}", "WARN")
                 if STATE.get("roe_valid", True) and roe > 0:
@@ -5379,31 +5448,41 @@ class LiveTradeManager:
                     DASHBOARD_STATE["live_trade_mode"] = False
                     return
 
-            old_conf = STATE.get("current_confidence", 50.0)
-            di_spread_change = (plus_di - minus_di) - STATE.get("prev_di_spread", 0)
-            new_conf = self.confidence_engine.update_live_confidence(old_conf, cont_pressure_score, failure_score, adx_slope, di_spread_change)
-            new_conf = ConfidenceEngine.apply_institutional_modifiers(new_conf, smart_money, momentum, continuation_eval.continuation_probability * 100)
-            STATE["current_confidence"] = new_conf
-            STATE["prev_di_spread"] = plus_di - minus_di
+            try:
+                old_conf = STATE.get("current_confidence", 50.0)
+                di_spread_change = (plus_di - minus_di) - STATE.get("prev_di_spread", 0)
+                new_conf = self.confidence_engine.update_live_confidence(old_conf, cont_pressure_score, failure_score, adx_slope, di_spread_change)
+                new_conf = ConfidenceEngine.apply_institutional_modifiers(new_conf, smart_money, momentum, continuation_eval.continuation_probability * 100)
+                STATE["current_confidence"] = new_conf
+                STATE["prev_di_spread"] = plus_di - minus_di
 
-            rejection_bull, _ = RejectionIntelligence.is_bullish_rejection(df_live, atr)
-            rejection_bear, _ = RejectionIntelligence.is_bearish_rejection(df_live, atr)
-            rejection_detected = (side == "BUY" and rejection_bull) or (side == "SELL" and rejection_bear)
-            failed_breakout = (trade_state == "FAKE_BREAKOUT") or (abs(continuation_eval.continuation_probability - 0.5) < 0.1 and roe < 2)
+                rejection_bull, _ = RejectionIntelligence.is_bullish_rejection(df_live, atr)
+                rejection_bear, _ = RejectionIntelligence.is_bearish_rejection(df_live, atr)
+                rejection_detected = (side == "BUY" and rejection_bull) or (side == "SELL" and rejection_bear)
+                failed_breakout = (trade_state == "FAKE_BREAKOUT") or (abs(continuation_eval.continuation_probability - 0.5) < 0.1 and roe < 2)
 
-            tp1_hold_score = self._compute_tp1_hold_score(
-                smart_money, momentum, adx_now, adx_slope, trade_state,
-                continuation_eval, smart_money.get("distribution_risk", 0),
-                rejection_detected, failed_breakout, roe
-            )
-            STATE["tp1_hold_score"] = tp1_hold_score
+                tp1_hold_score = self._compute_tp1_hold_score(
+                    smart_money, momentum, adx_now, adx_slope, trade_state,
+                    continuation_eval, smart_money.get("distribution_risk", 0),
+                    rejection_detected, failed_breakout, roe
+                )
+                STATE["tp1_hold_score"] = tp1_hold_score
 
-            exit_warning = self._compute_institutional_exit_warning(
-                smart_money, momentum, smart_money.get("distribution_risk", 0),
-                continuation_eval.continuation_probability, rejection_detected,
-                adx_slope, di_spread_change
-            )
-            STATE["exit_warning"] = exit_warning
+                exit_warning = self._compute_institutional_exit_warning(
+                    smart_money, momentum, smart_money.get("distribution_risk", 0),
+                    continuation_eval.continuation_probability, rejection_detected,
+                    adx_slope, di_spread_change
+                )
+                STATE["exit_warning"] = exit_warning
+            except Exception as _phase3_err:
+                log_execution(
+                    f"[HEAVY_CALC] cycle={_mgmt_cycle} symbol={symbol} trade_id={_tid} "
+                    f"stage=PHASE3_CONFIDENCE_GUARDS exc_type={type(_phase3_err).__name__} "
+                    f"exc={_phase3_err} ts={time.time():.3f}\n{traceback.format_exc()}",
+                    "WARN",
+                )
+                tp1_hold_score = STATE.get("tp1_hold_score", 10)
+                exit_warning = STATE.get("exit_warning", 0)
 
             # Persist advisory inputs so the non-heavy path can reuse them too.
             STATE["advisory_trend_health"] = trend_health
