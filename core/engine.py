@@ -620,6 +620,12 @@ SNAPSHOT_INTERVAL = 15
 BASE_SLEEP = 5
 KEEP_ALIVE_INTERVAL = 300
 
+# After a LIVE partial-close order is confirmed filled, the exchange position
+# endpoint may lag the order fill. Bound the convergence poll in close_partial
+# (LIVE) so local state never waits forever and never treats a transient stale
+# quantity as truth. Synchronization only -- never a trading decision authority.
+POSITION_CONFIRM_TIMEOUT = float(os.getenv("POSITION_CONFIRM_TIMEOUT", "3.0"))
+
 # External intelligence is advisory/alert-only. It must never call execute_entry().
 EXTERNAL_INTELLIGENCE_ENABLED = os.getenv("EXTERNAL_INTELLIGENCE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 EXTERNAL_INTELLIGENCE_INTERVAL_SEC = float(os.getenv("EXTERNAL_INTELLIGENCE_INTERVAL_SEC", "600"))
@@ -4066,8 +4072,24 @@ def close_partial(ratio, stage="PARTIAL"):
                 STATE["tp1_closed_qty"] = min(target_tp1_qty, float(STATE.get("tp1_closed_qty", 0.0) or 0.0) + float(filled_qty))
             TRADE_STATE["qty"] = STATE["remaining_qty"]
             log_execution(f"[CLOSE_PARTIAL] LIVE leg realized: {pnl_pct_leg:+.2f}% / {pnl_usdt_leg:+.2f} USDT @ {fill_price:.6f}", "SUCCESS")
-            time.sleep(1)
+            expected_remaining = max(0.0, STATE.get("remaining_qty", 0.0) or 0.0)
             pos, pos_status = fetch_position_status(symbol)
+            # Position endpoint may lag the just-confirmed fill; poll (bounded)
+            # until the residual quantity converges instead of a fixed wait.
+            # A transient NOT_FOUND while a residual is expected is the same
+            # convergence condition and is re-polled within the SAME window;
+            # a NOT_FOUND that persists through the window keeps the existing
+            # immediate terminal branch below. PAUSED/ERROR stay fail-closed.
+            # Synchronization only -- never a trading decision authority.
+            _pos_confirm_start = time.time()
+            while (expected_remaining > 1e-9
+                   and time.time() - _pos_confirm_start < POSITION_CONFIRM_TIMEOUT
+                   and (pos_status == "NOT_FOUND"
+                        or (pos_status == "OK" and pos is not None
+                            and abs(float(pos.get("contracts", 0)) - expected_remaining)
+                                >= 0.0001 * max(1, expected_remaining)))):
+                time.sleep(0.5)
+                pos, pos_status = fetch_position_status(symbol)
             if pos_status in ("ERROR", "PAUSED"):
                 _trade_event("POSITION_STATUS_UNKNOWN", reason=pos_status)
                 log_execution(f"[CLOSE_PARTIAL] Position status UNKNOWN ({pos_status}); preserving local state", "ERROR")
