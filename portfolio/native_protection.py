@@ -67,7 +67,7 @@ class NativeProtectionManager:
                 except Exception as verify_exc:
                     self.logger(f"[NATIVE_PROTECTION] {symbol} verification failed: {verify_exc}","ERROR")
                     return {"status":"UNPROTECTED","reason":"ORDER_VERIFICATION_FAILED"}
-            self._orders[symbol]={"sl_order_id":oid,"sl":float(sl),"updated_at":time.time()}
+            self._orders[symbol]={"sl_order_id":oid,"sl":float(sl),"qty":float(qty),"updated_at":time.time()}
             self.logger(f"[NATIVE_PROTECTION] {symbol} SL ACK id={oid} level={sl}","SUCCESS")
             return {"status":"PROTECTED","sl_order_id":oid,"sl":float(sl)}
         except Exception as exc:
@@ -97,3 +97,12 @@ class NativeProtectionManager:
         except Exception as exc:
             self.logger(f"[NATIVE_PROTECTION] {symbol} cancel failed: {exc}","WARN")
             return False
+
+    def info(self,symbol):
+        """Read-only snapshot of the tracked protective order for a symbol
+        (id, level, qty). None when no order is tracked. Used by the engine to
+        verify the protective order quantity against the venue position."""
+        item=self._orders.get(symbol)
+        if not item:
+            return None
+        return dict(item)

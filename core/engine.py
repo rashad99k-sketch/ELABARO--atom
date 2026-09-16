@@ -1861,6 +1861,8 @@ class PositionSnapshot:
         self.sl_price = 0.0
         self.partial_closed = False
         self.stale = False
+        self.roe_valid = True
+        self.data_quality = "FRESH"
         self.updated_at = 0.0
         self.source = "unknown"
 
@@ -1884,6 +1886,8 @@ class PositionSnapshot:
             "sl_price": self.sl_price,
             "partial_closed": self.partial_closed,
             "stale": self.stale,
+            "roe_valid": self.roe_valid,
+            "data_quality": self.data_quality,
             "updated_at": self.updated_at,
             "source": self.source
         }
@@ -2015,11 +2019,15 @@ class ExchangeSyncService:
                         stale.leverage = safe_float(STATE.get("leverage", LEVERAGE))
                         stale.liquidation_price = safe_float(STATE.get("liquidation_price", 0))
                         stale.roe_pct = safe_float(STATE.get("roe_pct", 0))
+                        stale.roe_valid = False
+                        stale.data_quality = "STALE"
                         stale.source = f"local_stale_{pos_status.lower()}"
                         stale.stale = True
                         stale.updated_at = time.time()
                         return stale if stale.qty > 0 else None
                     self._last_snapshot.stale = True
+                    self._last_snapshot.roe_valid = False
+                    self._last_snapshot.data_quality = "STALE"
                     self._last_snapshot.updated_at = time.time()
                     self._last_snapshot.source = f"rest_sync_{pos_status.lower()}"
                     return self._last_snapshot
@@ -2043,6 +2051,8 @@ class ExchangeSyncService:
                 snapshot.roe_pct = raw_move * snapshot.leverage
             snapshot.updated_at = time.time()
             snapshot.source = "rest_sync"
+            snapshot.roe_valid = True
+            snapshot.data_quality = "FRESH"
             self._last_snapshot = snapshot
             return snapshot
         except Exception as e:
@@ -2063,6 +2073,8 @@ class ExchangeSyncService:
         snap.roe_pct = (snap.unrealized_pnl / snap.margin) * 100 if snap.margin else 0
         snap.updated_at = time.time()
         snap.source = "paper"
+        snap.roe_valid = True
+        snap.data_quality = "FRESH"
         return snap
 
     def reconcile(self, symbol, local_state):
@@ -2094,6 +2106,8 @@ class ExchangeSyncService:
             STATE["mark_price"] = snap.mark_price
             STATE["unrealized_pnl_usdt"] = snap.unrealized_pnl
             STATE["roe_pct"] = snap.roe_pct
+            STATE["roe_valid"] = bool(getattr(snap, "roe_valid", True))
+            STATE["management_data_quality"] = str(getattr(snap, "data_quality", "FRESH") or "UNKNOWN")
             STATE["margin"] = snap.margin
             STATE["liquidation_price"] = snap.liquidation_price
             TRADE_STATE.update({
@@ -3693,7 +3707,7 @@ def _ensure_native_protection(symbol):
             _native_protection_diagnostics(blocked=True)
             return {"status": "ERROR", "reason": _NATIVE_PROTECTION_ERROR}
     try:
-        result = _NATIVE_PROTECTION.place(
+        result = _NATIVE_PROTECTION.update(
             symbol, STATE.get("side"), STATE.get("remaining_qty", STATE.get("qty", 0.0)),
             STATE.get("synthetic_sl", STATE.get("sl", 0.0)),
             _hedge_position_side(STATE.get("side")),
@@ -3702,7 +3716,163 @@ def _ensure_native_protection(symbol):
         _set_protection_status("UNPROTECTED",
                                reason=f"INIT_FAILED: {_sanitize_reason(exc)}")
         return {"status": "UNPROTECTED", "reason": _sanitize_reason(exc)}
-    return _set_protection_status(result.get("status", "UNPROTECTED"), result.get("sl_order_id"), result.get("reason"))
+    payload = _set_protection_status(result.get("status", "UNPROTECTED"), result.get("sl_order_id"), result.get("reason"))
+    if str(result.get("status", "")).upper() == "PROTECTED":
+        # Exchange confirmed protection: adopt the tracked level/quantity and
+        # verify the venue position qty against the protective order qty (F1).
+        STATE["last_confirmed_sl"] = float(STATE.get("synthetic_sl", STATE.get("sl", 0.0)) or 0.0)
+        STATE["protection_confirmed"] = True
+        try:
+            _verify_protection_qty(symbol, STATE.get("side"), STATE.get("remaining_qty", STATE.get("qty", 0.0)))
+        except Exception:
+            pass
+    return payload
+
+def _is_more_protective(side, proposed, confirmed):
+    """Monotonic protection comparison (F5): True when `proposed` is at least as
+    protective as the last `confirmed` SL for the given LONG/SHORT direction.
+    A zero/negative confirmed level is treated as 'never confirmed'."""
+    proposed = float(proposed or 0.0)
+    confirmed = float(confirmed or 0.0)
+    if confirmed <= 0:
+        return True
+    if str(side).upper() == "BUY":
+        return proposed + 1e-9 >= confirmed - 1e-9
+    return proposed - 1e-9 <= confirmed + 1e-9
+
+
+def _verify_protection_qty(symbol, side, expected_qty):
+    """F1: verify the actual venue position quantity against the protective
+    order quantity recorded by the native manager. Read-only; surfaces
+    mismatches via events/logs and never mutates the position.
+    Returns (quality_tag, info) with quality in MATCH / MISMATCH / UNKNOWN."""
+    try:
+        expected_qty = float(expected_qty or 0.0)
+        rec = None
+        if _NATIVE_PROTECTION is not None:
+            rec = _NATIVE_PROTECTION.info(symbol)
+        pos, pos_status = fetch_position_status(symbol)
+        if pos_status in ("PAUSED", "ERROR"):
+            _trade_event("PROTECTION_QTY_UNKNOWN", reason=str(pos_status))
+            return "UNKNOWN", {"pos_status": str(pos_status)}
+        if pos is None:
+            _trade_event("PROTECTION_QTY_UNKNOWN", reason="POSITION_NOT_FOUND")
+            return "UNKNOWN", {"pos": None}
+        try:
+            actual_qty = float(pos.get("contracts", 0) or 0)
+        except (TypeError, ValueError):
+            actual_qty = -1.0
+        order_qty = (rec or {}).get("qty")
+        if order_qty is None:
+            _trade_event("PROTECTION_QTY_UNKNOWN", reason="NO_TRACKED_ORDER")
+            return "UNKNOWN", {"pos_qty": actual_qty}
+        order_qty = float(order_qty or 0.0)
+        tol = max(1e-6, expected_qty * 0.01)
+        if abs(actual_qty - order_qty) > tol or abs(actual_qty - expected_qty) > tol:
+            log_execution(
+                f"[PROTECTION_QTY] MISMATCH {symbol}: position={actual_qty:.6f} "
+                f"protective_order={order_qty:.6f} expected={expected_qty:.6f}", "WARN")
+            _trade_event("PROTECTION_QTY_MISMATCH", pos_qty=actual_qty,
+                         order_qty=order_qty, expected_qty=expected_qty)
+            return "MISMATCH", {"pos_qty": actual_qty, "order_qty": order_qty,
+                                "expected_qty": expected_qty}
+        return "MATCH", {"pos_qty": actual_qty, "order_qty": order_qty}
+    except Exception as exc:
+        log_execution(f"[PROTECTION_QTY] verify error: {exc}", "WARN")
+        return "UNKNOWN", {"error": str(exc)}
+
+
+def _protection_commit(symbol, side, qty, proposed_sl, reason, *,
+                       verify_qty=True, force=False, adopt_paper=True):
+    """Single Protection Authority (F1/F2/F3/F5): DECISION -> REQUEST ->
+    EXCHANGE RESPONSE -> VERIFICATION -> STATE COMMIT for a proposed protective
+    stop level.
+
+    - Monotonic guard (F5): a proposed SL that is LESS protective than the last
+      confirmed one is rejected (unless force=True, reserved for documented
+      emergency/safety callers). Persisted state can never replace a newer
+      exchange-confirmed SL with an older, less protective level.
+    - Exchange path (F1/F2): uses NativeProtectionManager.update
+      (place-first / cancel-second) so the position is never left without
+      protection during a cancel/replace: the previous order is retired only
+      after the replacement reports PROTECTED.
+    - STATE COMMIT happens only AFTER exchange confirmation in LIVE-with-native
+      (no DECISION -> STATE COMMIT pretending the exchange succeeded). In PAPER,
+      or when native is not configured, the commit passes through the monotonic
+      check only.
+    - On any exchange failure the previous confirmed protection is retained and
+      the failure is surfaced through protection status and events. The position
+      is never marked as protected when the exchange did not confirm it.
+    """
+    side = str(side or STATE.get("side") or "BUY").upper()
+    qty = float(qty or 0.0)
+    propsl = float(proposed_sl or 0.0)
+    prev_sl = float(STATE.get("synthetic_sl", 0.0) or 0.0)
+    confirmed = float(STATE.get("last_confirmed_sl", 0.0) or 0.0)
+    retain_sl = confirmed if confirmed > 0 else prev_sl
+    if retain_sl <= 0:
+        retain_sl = propsl
+    result = {"status": "PAPER_SYNTHETIC", "sl": propsl, "reason": reason}
+
+    if not (force or _is_more_protective(side, propsl, confirmed or prev_sl)):
+        log_execution(
+            f"[PROTECTION] rejected {reason}: proposed SL {propsl:.4f} is less "
+            f"protective than confirmed SL {confirmed:.4f} (side={side})", "WARN")
+        _trade_event("PROTECTION_REJECTED", reason=reason, proposed_sl=propsl,
+                     confirmed_sl=(confirmed or prev_sl))
+        return {"status": "REJECTED_LESS_PROTECTIVE", "sl": retain_sl, "reason": reason}
+
+    native_on = False
+    if MODE_LIVE and _NATIVE_PROTECTION is not None:
+        try:
+            native_on = bool(getattr(_NATIVE_PROTECTION, "enabled", False))
+        except Exception:
+            native_on = False
+
+    if MODE_LIVE and native_on:
+        if qty <= 0:
+            _set_protection_status("UNPROTECTED", reason=f"NO_QTY_{reason}")
+            return {"status": "UNPROTECTED", "sl": retain_sl, "reason": f"NO_QTY:{reason}"}
+        try:
+            _np = _NATIVE_PROTECTION.update(symbol, side, qty, propsl,
+                                            _hedge_position_side(side))
+        except Exception as exc:
+            _set_protection_status("UNPROTECTED",
+                                   reason=f"PROTECTION_COMMIT_FAILED: {_sanitize_reason(exc)}")
+            _trade_event("PROTECTION_UPDATE_FAILED", reason=str(exc), proposed_sl=propsl)
+            return {"status": "UNPROTECTED", "sl": retain_sl,
+                    "reason": f"UPDATE_FAILED:{_sanitize_reason(exc)}"}
+        status = str(_np.get("status", "UNPROTECTED") or "UNPROTECTED").upper()
+        result = {"status": status, "sl_order_id": _np.get("sl_order_id"),
+                  "sl": propsl, "reason": _np.get("reason") or reason}
+        _set_protection_status(status, result.get("sl_order_id"), result.get("reason"))
+        if status != "PROTECTED":
+            _trade_event("PROTECTION_UPDATE_FAILED", status=status, reason=result.get("reason"))
+            return {"status": status, "sl": retain_sl, "reason": result.get("reason") or reason}
+        if verify_qty:
+            try:
+                _verify_protection_qty(symbol, side, qty)
+            except Exception:
+                pass
+    elif not adopt_paper:
+        # LIVE protection requirement without a configured native adapter is
+        # fail-closed (see the native LIVE safety gate). No internal claim.
+        return {"status": "UNPROTECTED", "sl": retain_sl,
+                "reason": f"NATIVE_NOT_CONFIGURED:{reason}"}
+
+    # ---- STATE COMMIT (only after exchange confirmation when required) ------
+    STATE["synthetic_sl"] = propsl
+    STATE["last_confirmed_sl"] = propsl
+    STATE["protection_confirmed"] = True
+    STATE["profit_protection_reason"] = reason
+    _cur_sl = float(STATE.get("sl", 0.0) or 0.0)
+    if _cur_sl <= 0:
+        STATE["sl"] = propsl
+    elif side == "BUY":
+        STATE["sl"] = max(_cur_sl, propsl)
+    else:
+        STATE["sl"] = min(_cur_sl, propsl)
+    return result
 
 _protection_required_warned = False
 
@@ -4181,6 +4351,14 @@ def close_position_full(close_price=None, stage="FULL"):
         return False
     _closing_in_progress = True
     _reconciliation_pending = True
+    if not STATE.get("open"):
+        # F9: a single logical exit event must produce ONE close decision. A
+        # concurrent/repeated tick on an already-closed position must not emit a
+        # second close (PAPER previously double-booked; LIVE was already guarded).
+        _closing_in_progress = False
+        _reconciliation_pending = False
+        log_execution("[CLOSE] No open position to close; skipping duplicate", "WARN")
+        return False
     _trade_event("CLOSE_REQUESTED", reason="MANAGEMENT", stage=str(stage).upper())
     try:
         # Phase 2 (Decision 2): every full close must carry a REAL close_reason
@@ -4769,13 +4947,14 @@ class LiveTradeManager:
                 STATE["close_reason"] = "REVERSAL"
                 close_position_full()
                 return True
-            elif (reversal_medium or combined_medium) and not STATE.get("tp1_hit", False) and roe > 0:
+            elif (reversal_medium or combined_medium) and not STATE.get("tp1_hit", False) and STATE.get("roe_valid", True) and roe > 0:
                 # Medium evidence before TP1 never executes a profit partial.
                 # The only partial is canonical TP1 (50%). Here we protect profit
                 # and let the TP1 engine decide when the first banked leg is due.
                 STATE["dynamic_reversal_exit_done"] = True
-                STATE["synthetic_sl"] = entry
-                STATE["sl"] = entry
+                _protection_commit(
+                    symbol, side, STATE.get("remaining_qty", STATE.get("qty", 0.0)),
+                    entry, reason="REVERSAL_MEDIUM_PROTECTED")
                 log_execution(
                     f"[DYNAMIC] {trade_type_cur} reversal medium evidence -> "
                     f"profit protected, waiting canonical TP1 | {symbol} ROE={roe:.2f}% health={health_score:.1f} "
@@ -4797,7 +4976,9 @@ class LiveTradeManager:
                 (exhaustion_risk > 65) or (health_action in ("PARTIAL", "PROTECT_PROFIT") and cont < 0.5)
             ):
                 STATE["dynamic_exhaustion_protect_done"] = True
-                STATE["synthetic_sl"] = entry  # lock at breakeven
+                _protection_commit(
+                    symbol, side, STATE.get("remaining_qty", STATE.get("qty", 0.0)),
+                    entry, reason="EXHAUSTION_PROTECTED")
                 STATE["trail_stop"] = entry if side == "BUY" else entry
                 log_execution(
                     f"[DYNAMIC] Exhaustion protect | {symbol} SL ratcheted to breakeven "
@@ -4820,10 +5001,11 @@ class LiveTradeManager:
                 trade_state=trade_state, cont=cont, dist_risk=dist_risk,
                 exhaustion_risk=exhaustion_risk, momentum_decay=momentum_decay,
                 structure_aligned=structure_aligned)
-            if is_correction and roe >= roe_target and cont < 0.62:
+            if is_correction and STATE.get("roe_valid", True) and roe >= roe_target and cont < 0.62:
                 STATE["dynamic_partial_done"] = True
-                STATE["synthetic_sl"] = entry
-                STATE["sl"] = entry
+                _protection_commit(
+                    symbol, side, STATE.get("remaining_qty", STATE.get("qty", 0.0)),
+                    entry, reason="EARLY_PROFIT_PROTECTION_WAIT_TP1")
                 STATE["profit_protection_reason"] = "EARLY_PROFIT_PROTECTION_WAIT_TP1"
                 log_execution(
                     f"[DYNAMIC] Early profit protection (correction evidence: "
@@ -5169,11 +5351,12 @@ class LiveTradeManager:
             STATE["thesis_failure_score"] = failure_score
             if failed:
                 log_execution(f"[THESIS_FAILURE] Thesis failed for {symbol}: {failure_reasons}", "WARN")
-                if roe > 0:
-                    STATE["synthetic_sl"] = entry
-                    STATE["sl"] = entry
-                    STATE["profit_protection_reason"] = "THESIS_FAILURE_PROFIT_PROTECTED"
-                    log_execution("[THESIS_FAILURE] Profit protected at breakeven; no pre-TP1 partial", "WARN")
+                if STATE.get("roe_valid", True) and roe > 0:
+                    _thcomm = _protection_commit(
+                        symbol, side, STATE.get("remaining_qty", STATE.get("qty", 0.0)),
+                        entry, reason="THESIS_FAILURE_PROFIT_PROTECTED")
+                    if str(_thcomm.get("status", "")).upper() in ("PROTECTED", "PAPER_SYNTHETIC"):
+                        log_execution("[THESIS_FAILURE] Profit protected at breakeven; no pre-TP1 partial", "WARN")
                 else:
                     STATE["close_reason"] = "THESIS_FAILURE"
                     close_position_full()
@@ -5301,11 +5484,12 @@ class LiveTradeManager:
             log_execution(f"[PROFIT_LOCK] Aggressive profit lock triggered (state={trade_state})", "WARN")
             if STATE.get("tp1_hit", False):
                 STATE["profit_lock_activated"] = True
-            elif roe > 0:
-                STATE["synthetic_sl"] = entry
-                STATE["sl"] = entry
-                STATE["profit_protection_reason"] = "DEFENSIVE_BEFORE_TP1"
-                _trade_event("PROFIT_PROTECTION", lock_price=entry, reason="DEFENSIVE_BEFORE_TP1_NO_PARTIAL")
+            elif STATE.get("roe_valid", True) and roe > 0:
+                _defcomm = _protection_commit(
+                    symbol, side, STATE.get("remaining_qty", STATE.get("qty", 0.0)),
+                    entry, reason="DEFENSIVE_BEFORE_TP1")
+                if str(_defcomm.get("status", "")).upper() in ("PROTECTED", "PAPER_SYNTHETIC"):
+                    _trade_event("PROFIT_PROTECTION", lock_price=entry, reason="DEFENSIVE_BEFORE_TP1_NO_PARTIAL")
 
         if self.brain.should_hard_exit():
             log_execution(f"[HARD_EXIT] Hard exit triggered (state={trade_state})", "ERROR")
@@ -5329,6 +5513,12 @@ class LiveTradeManager:
             synthetic_sl = entry + entry_atr * base_sl_mult
             if STATE.get("tp1_hit", False) or STATE.get("be_ratchet_active", False):
                 synthetic_sl = min(synthetic_sl, entry)
+        # F3/F5: a transient or older recompute proposal must never wipe a newer
+        # confirmed protection. Clamp to the last exchange-confirmed SL when the
+        # recomputed base is less protective.
+        _confirmed_clamp = float(STATE.get("last_confirmed_sl", 0.0) or 0.0)
+        if _confirmed_clamp > 0 and not _is_more_protective(side, synthetic_sl, _confirmed_clamp):
+            synthetic_sl = _confirmed_clamp
         _old_synth_sl = float(STATE.get("synthetic_sl", 0.0) or 0.0)
         STATE["synthetic_sl"] = synthetic_sl
         if (MODE_LIVE and _NATIVE_PROTECTION is not None and
@@ -5351,21 +5541,18 @@ class LiveTradeManager:
         # Guaranteed profit-protection ratchet: once ROE is meaningfully
         # positive, breakeven protection is independent of TP1 scoring. It never
         # marks TP1 as done and it only moves the stop in the protective direction.
-        if roe >= float(os.getenv("BREAKEVEN_RATCHET_ROE", "2.0")):
+        if STATE.get("roe_valid", True) and roe >= float(os.getenv("BREAKEVEN_RATCHET_ROE", "2.0")):
             _old_sl = float(STATE.get("synthetic_sl", STATE.get("sl", 0.0)) or 0.0)
             _be_sl = entry
-            if side == "BUY":
-                if _old_sl < _be_sl:
-                    STATE["synthetic_sl"] = _be_sl
-                    STATE["sl"] = max(float(STATE.get("sl", 0.0) or 0.0), _be_sl)
+            _ratchet_need = (side == "BUY" and _old_sl < _be_sl) or \
+                            (side == "SELL" and (_old_sl <= 0 or _old_sl > _be_sl))
+            if _ratchet_need:
+                _be_committed = _protection_commit(
+                    symbol, side, STATE.get("remaining_qty", STATE.get("qty", 0.0)),
+                    _be_sl, reason="BREAKEVEN_RATCHET")
+                if str(_be_committed.get("status", "")).upper() in ("PROTECTED", "PAPER_SYNTHETIC"):
                     STATE["be_ratchet_active"] = True
-                    _trade_event("BREAKEVEN_RATCHET", roe=roe, stop=_be_sl)
-            else:
-                if _old_sl <= 0 or _old_sl > _be_sl:
-                    STATE["synthetic_sl"] = _be_sl
-                    STATE["sl"] = min(float(STATE.get("sl", _be_sl) or _be_sl), _be_sl)
-                    STATE["be_ratchet_active"] = True
-                    _trade_event("BREAKEVEN_RATCHET", roe=roe, stop=_be_sl)
+                    _trade_event("BREAKEVEN_RATCHET", roe=roe, stop=STATE["synthetic_sl"])
         # ---- Canonical TP authority -----------------------------------------
         # Every TP order is submitted and verified by apply_profit_engine().
         # This prevents the manager from having a second independent TP path.
@@ -5424,7 +5611,7 @@ class LiveTradeManager:
         # Tight assets trail closer (smaller ATR multiple); never loosen beyond base.
         trail_mult = trail_mult * max(0.55, min(1.0, asset_trail_base / 3.0))
 
-        if roe > trail_activate_roe:
+        if STATE.get("roe_valid", True) and roe > trail_activate_roe:
             if not STATE.get("trail_activated", False):
                 STATE["trail_activated"] = True
                 STATE["trail_stop"] = synthetic_sl
@@ -5519,6 +5706,8 @@ def sync_position_state(symbol=None):
                 raw_pnl = (price - STATE["entry"])/STATE["entry"]*100 if STATE["side"]=="BUY" else (STATE["entry"]-price)/STATE["entry"]*100
                 roe_pct = raw_pnl * LEVERAGE
                 STATE["roe_pct"] = roe_pct
+                STATE["roe_valid"] = True
+                STATE["management_data_quality"] = "FRESH"
                 STATE["mark_price"] = price
                 STATE["unrealized_pnl_usdt"] = (price - STATE["entry"]) * STATE["qty"] if STATE["side"]=="BUY" else (STATE["entry"] - price) * STATE["qty"]
                 return price, 0.0, 0.0, roe_pct
@@ -5542,6 +5731,13 @@ def sync_position_state(symbol=None):
 
     with _TRADE_LOCK:
         if not STATE.get("open"):
+            # New position lifecycle: reset profit-management protection state so
+            # no confirmed level from a previous trade leaks across symbols.
+            STATE["last_confirmed_sl"] = 0.0
+            STATE["protection_confirmed"] = False
+            STATE["roe_valid"] = True
+            STATE["management_data_quality"] = "UNKNOWN"
+            STATE["profit_protection_reason"] = None
             STATE["open"] = True
             STATE["side"] = snap.side
             STATE["entry"] = snap.entry_price
@@ -5581,6 +5777,8 @@ def sync_position_state(symbol=None):
         STATE["margin"] = snap.margin
         STATE["unrealized_pnl_usdt"] = snap.unrealized_pnl
         STATE["roe_pct"] = snap.roe_pct
+        STATE["roe_valid"] = bool(getattr(snap, "roe_valid", True))
+        STATE["management_data_quality"] = str(getattr(snap, "data_quality", "FRESH") or "UNKNOWN")
         STATE["leverage"] = snap.leverage
         STATE["mark_price"] = snap.mark_price
         STATE["liquidation_price"] = snap.liquidation_price
@@ -6175,6 +6373,8 @@ def apply_profit_engine(symbol, current_price, df, idx, position_state):
         position_state["tp1_done"] = True
         position_state["sl"] = entry
         position_state["synthetic_sl"] = entry
+        position_state["last_confirmed_sl"] = entry
+        position_state["protection_confirmed"] = True
         position_state["profit_lock_activated"] = True
         position_state["runner_mode"] = True
         position_state["trail_activated"] = True
@@ -6715,6 +6915,8 @@ STATE = {
     "tp1_hit": False, "tp2_hit": False,
     "zone": {},
     "initial_margin": 0.0, "real_unrealized_pnl": 0.0, "roe_pct": 0.0, "leverage": LEVERAGE,
+    "roe_valid": True, "management_data_quality": "UNKNOWN",
+    "last_confirmed_sl": 0.0, "protection_confirmed": False,
     "smart_tightened": False, "smart_partial_done": False, "smart_exit_triggered": False,
     "mark_price": 0.0, "unrealized_pnl_usdt": 0.0,
     "margin": 0.0, "liquidation_price": 0.0,
@@ -7056,6 +7258,16 @@ def _refresh_live_levels(entry, side, atr, symbol, classification=None):
                 tp2 = min(tp2, entry - min_dist)
     else:
         sl, tp1, tp2 = _enforce_sl_tp_geometry(side, entry, sl, tp1, tp2, atr, symbol=symbol)
+    # F5: a confirmed protective SL is monotonic in the favourable direction.
+    # Persisted state can never erode below the last exchange-confirmed level.
+    _p_confirmed = float(STATE.get("last_confirmed_sl", 0.0) or 0.0)
+    if _p_confirmed > 0:
+        if sl <= 0:
+            sl = _p_confirmed
+        elif side == "BUY":
+            sl = max(sl, _p_confirmed)
+        else:
+            sl = min(sl, _p_confirmed)
     STATE["synthetic_tp1"] = tp1
     STATE["synthetic_tp2"] = tp2
     STATE["tp1_price"] = tp1
@@ -7756,6 +7968,11 @@ def finalize_trade_with_reality(symbol):
         STATE["dynamic_reversal_exit_done"] = False
         STATE["dynamic_exhaustion_protect_done"] = False
         STATE["dynamic_partial_done"] = False
+        STATE["last_confirmed_sl"] = 0.0
+        STATE["protection_confirmed"] = False
+        STATE["roe_valid"] = True
+        STATE["management_data_quality"] = "UNKNOWN"
+        STATE["profit_protection_reason"] = None
         if _live_manager is not None:
             _live_manager.position_profile = None
             _live_manager._last_position_action = None
@@ -8523,6 +8740,14 @@ def _reconcile_levels_after_fill(actual_entry, symbol, side, trade_type, classif
                 changed = True
 
         STATE["entry"] = actual_entry
+        # F5: a fill/levels reconciliation must never erode a newer
+        # exchange-confirmed protective SL (e.g., after ratchet or TP1).
+        _f5_confirmed = float(STATE.get("last_confirmed_sl", 0.0) or 0.0)
+        if _f5_confirmed > 0:
+            if str(side).upper() == "BUY":
+                n_sl = max(float(n_sl or 0.0), _f5_confirmed)
+            elif n_sl:
+                n_sl = min(float(n_sl), _f5_confirmed)
         STATE["sl"] = n_sl
         STATE["tp1_price"] = n_tp1
         STATE["tp2_price"] = n_tp2
