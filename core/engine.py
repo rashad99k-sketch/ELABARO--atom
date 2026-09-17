@@ -512,6 +512,82 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 _last_tg_msg = {}
 
+# ========== CLOSE-IDENTITY LEDGER (durable Telegram dedup) ==========
+# Root-cause (duplicate "TRADE CLOSED" telegrams with changing REC ids): a
+# physical position that disappears from local context can be re-adopted from
+# the venue with a NEW trade_id (REC-{symbol}-{side}-{millis}); each re-adoption
+# that then reaches finalize emits a fresh close notification whose send_once
+# dedup key (close_{trade_id or symbol}, 10s in-memory) is defeated by the new
+# id. The stable identity of a PHYSICAL position is its venue attributes, not
+# the local record id: symbol|side|entry|qty_initial. Once a close for that
+# identity has been announced, the SAME physical position must never re-announce
+# inside the dedup window -- even after a restart (this ledger is durable).
+_CLOSE_LEDGER_PATH = os.getenv("CLOSE_LEDGER_PATH", "runtime/close_identity_ledger.json")
+CLOSE_ANNOUNCE_DEDUP_WINDOW = float(os.getenv("CLOSE_ANNOUNCE_DEDUP_WINDOW", "86400"))
+_close_identity_ledger = {}
+_ledger_lock = threading.Lock()
+_ledger_loaded = False
+
+
+def _close_identity_key(symbol, side, entry, qty_initial):
+    """Stable identity of a physical position for close-announcement dedup.
+    Uses venue attributes only (never the local REC trade_id, which changes on
+    every re-adoption that produced the duplicate notifications)."""
+    try:
+        _e = round(float(entry or 0.0), 8)
+    except Exception:
+        _e = 0.0
+    try:
+        _q = round(float(qty_initial or 0.0), 8)
+    except Exception:
+        _q = 0.0
+    return f"{symbol}|{str(side).upper()}|{_e:.8f}|{_q:.8f}"
+
+
+def _load_close_ledger():
+    global _close_identity_ledger, _ledger_loaded
+    if _ledger_loaded:
+        return
+    try:
+        if os.path.exists(_CLOSE_LEDGER_PATH):
+            with open(_CLOSE_LEDGER_PATH, "r", encoding="utf-8") as fh:
+                _close_identity_ledger = json.load(fh) or {}
+    except Exception:
+        _close_identity_ledger = {}
+    _ledger_loaded = True
+
+
+def _reset_close_ledger():
+    global _close_identity_ledger, _ledger_loaded
+    with _ledger_lock:
+        _close_identity_ledger = {}
+        _ledger_loaded = True
+
+
+def _persist_close_ledger():
+    try:
+        _dir = os.path.dirname(_CLOSE_LEDGER_PATH)
+        if _dir:
+            os.makedirs(_dir, exist_ok=True)
+        with open(_CLOSE_LEDGER_PATH, "w", encoding="utf-8") as fh:
+            json.dump(_close_identity_ledger, fh, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def _is_close_announced(key):
+    with _ledger_lock:
+        _load_close_ledger()
+        ts = _close_identity_ledger.get(key, 0.0)
+        return (time.time() - ts) < CLOSE_ANNOUNCE_DEDUP_WINDOW
+
+
+def _announce_close(key):
+    with _ledger_lock:
+        _close_identity_ledger[key] = time.time()
+        _persist_close_ledger()
+
+
 def _tg_send(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -566,7 +642,18 @@ def tg_close(symbol, pnl_pct, duration_min, side, pnl_usdt=None, reason=None, tr
     )
     if trade_id:
         msg += f"\n🆔 {str(trade_id)[:60]}"
-    send_once(msg, f"close_{trade_id or symbol}", 10)
+    # Durable dedup: the same PHYSICAL position (same symbol/side/entry/qty) must
+    # never re-announce its close, even after a restart or after being re-adopted
+    # with a brand-new REC id. The identity ignores trade_id on purpose.
+    _id_key = _close_identity_key(
+        symbol, side, entry if entry is not None else STATE.get("entry"),
+        STATE.get("qty_initial") or STATE.get("qty") or 0.0,
+    )
+    if _is_close_announced(_id_key):
+        log_execution(f"[TELEGRAM] close already announced for {symbol} {side}; suppressing duplicate (identity {_id_key})", "WARN", debounce_key=f"tg_dup_{_id_key}", debounce_sec=60)
+        return
+    _announce_close(_id_key)
+    send_once(msg, f"close_{_id_key}", 10)
 
 def tg_error(err_msg, error_type="EXECUTION"):
     send_once(f"🚨 <b>ERROR</b> [{error_type}]\n{err_msg[:200]}", f"err_{error_type}_{err_msg[:50]}", 60)
@@ -615,6 +702,18 @@ MAX_DAILY_LOSS_PCT = 5.0
 MAX_CONSECUTIVE_LOSSES = 3
 COOLDOWN_MINUTES_LOSS = 10
 COOLDOWN_MINUTES_DRAWDOWN = 20
+
+# ===== SINGLE-TP PROFIT TAKING (authoritative, one source of truth) =====
+# When enabled, TP1 is the ONLY take-profit: it closes the FULL remaining
+# position (100%) through the same verified close pipeline used by TP2.
+# TP2, runner-mode extension and partial scale-outs are all disabled in this
+# mode. These knobs are intentionally derived from SINGLE_TP_ENABLED so there
+# is never a second, competing profit-taking authority.
+SINGLE_TP_ENABLED = os.getenv("SINGLE_TP_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+SINGLE_TP_CLOSE_FRACTION = 1.0
+TP2_ENABLED = not SINGLE_TP_ENABLED
+RUNNER_ENABLED = not SINGLE_TP_ENABLED
+PARTIAL_CLOSE_ENABLED = not SINGLE_TP_ENABLED
 
 SNAPSHOT_INTERVAL = 15
 BASE_SLEEP = 5
@@ -3966,6 +4065,10 @@ def _cancel_native_protection(symbol):
 
 def close_partial(ratio, stage="PARTIAL"):
     global _closing_in_progress, _reconciliation_pending
+    _partial_ok = bool(PARTIAL_CLOSE_ENABLED) and not bool(SINGLE_TP_ENABLED)
+    if not _partial_ok:
+        log_execution(f"[CLOSE_PARTIAL] Partial close disabled (SINGLE_TP={bool(SINGLE_TP_ENABLED)}, PARTIAL_CLOSE_ENABLED={bool(PARTIAL_CLOSE_ENABLED)}, stage={stage})", "WARN")
+        return False
     if _closing_in_progress:
         log_execution("[CLOSE_PARTIAL] Already closing, skipping", "WARN")
         return False
@@ -4037,6 +4140,9 @@ def close_partial(ratio, stage="PARTIAL"):
         side = "sell" if STATE["side"] == "BUY" else "buy"
         sym = normalize_symbol(symbol)
         qty_precise = float(ex.amount_to_precision(sym, qty_to_close))
+        if not _close_partial_min_ok(symbol, sym, qty_to_close):
+            _trade_event(f"{stage_u}_EXECUTION_FAILED", reason="BELOW_MIN_QUANTITY")
+            return False
         order = safe_api_call(ex.create_order, sym, "market", side, qty_precise, params={"positionSide": _hedge_position_side(STATE["side"])})
         if order is None:
             log_execution("[CLOSE_PARTIAL] Order creation failed (None)", "ERROR")
@@ -4258,6 +4364,36 @@ def _sync_closed_on_exchange(symbol, reason, pos_side, opposite_exists=False, fr
     return True
 
 
+def _close_partial_min_ok(symbol, sym, qty):
+    """LIVE close safety: validate a close quantity against the venue's market
+    limits (zero / min amount / min notional) BEFORE an order is placed. A tiny
+    or overflowing remainder must never be blindly re-ordered -- the exchange
+    would reject it and the close lifecycle would retry forever. Returns False
+    and emits CLOSE_FAILED when the quantity cannot possibly fill."""
+    try:
+        if qty is None or float(qty) <= 0:
+            log_execution("[CLOSE] quantity must be > 0 to place a close order", "ERROR")
+            _trade_event("CLOSE_FAILED", reason="INVALID_QUANTITY_ZERO")
+            return False
+        market = ex.market(sym)
+        limits = market.get("limits", {}).get("amount", {}) or {}
+        min_amt = float(limits.get("min", 0.0) or 0.0)
+        if min_amt > 0 and float(qty) < min_amt:
+            log_execution(f"[CLOSE] {symbol} close qty {float(qty):.6f} below market minimum {min_amt:.6f}; refusing unsizeable close", "ERROR")
+            _trade_event("CLOSE_FAILED", reason=f"BELOW_MIN_QUANTITY:{float(qty):.6f}<{min_amt:.6f}")
+            return False
+        _prec = market.get("precision", {}).get("amount", 0) or 0
+        if _prec:
+            _step = 10 ** -float(_prec)
+            if _step > 0 and abs((float(qty) / _step) - round(float(qty) / _step)) > 1e-9:
+                log_execution(f"[CLOSE] {symbol} close qty {float(qty):.6f} is not a multiple of precision step {_step}", "WARN")
+    except Exception:
+        # Limit lookup is advisory-only: never block a close on a metadata
+        # fetch failure. The verified position path is authoritative.
+        pass
+    return True
+
+
 def _close_full_live_verified(symbol, sym, pos_side, stage, requested_qty):
     """Verified full-close transaction (LIVE mode only).
 
@@ -4287,6 +4423,9 @@ def _close_full_live_verified(symbol, sym, pos_side, stage, requested_qty):
         if qty_this < requested_qty - 1e-12:
             log_execution(f"[CLOSE] {symbol} {pos_side}: local qty {requested_qty:.6f} > venue qty {actual_qty:.6f}; closing venue qty", "WARN")
         qty_precise = float(ex.amount_to_precision(sym, qty_this))
+        if not _close_partial_min_ok(symbol, sym, qty_this):
+            _log_close_outcome(symbol, pos_side, "CLOSE_FAILED", "BELOW_MIN_QUANTITY")
+            return False
         log_execution(f"[CLOSE] verified {symbol} {pos_side} qty={actual_qty:.6f} -> placing market close (attempt {attempt})", "INFO")
         try:
             order = safe_api_call(ex.create_order, sym, "market", req_side, qty_precise, params={"positionSide": pos_side})
@@ -5679,6 +5818,14 @@ class LiveTradeManager:
             DASHBOARD_STATE["live_trade_mode"] = False
             return
         if tp_action == "TP1":
+            if SINGLE_TP_ENABLED and STATE.get("close_reason") == "SINGLE_TP":
+                # Single TP closes the FULL position on the first take-profit
+                # touch: this is a terminal close, not a 50% scale-out. Emit the
+                # lifecycle CLOSED transition exactly like the legacy TP2 path so
+                # the adoption/sync loop never sees a lingering context.
+                self.event_bus.emit("lifecycle_change", TradeLifecycleState.CLOSED)
+                DASHBOARD_STATE["live_trade_mode"] = False
+                return
             self._update_peak_profit(roe, mark_price)
             _trade_event("PROFIT_LOCK", lock_price=entry, reason="TP1_VERIFIED")
 
@@ -6400,15 +6547,23 @@ def decision_engine(scenario, rf_signal, adx):
     return "SKIP"
 
 def apply_profit_engine(symbol, current_price, df, idx, position_state):
-    """Canonical two-stage profit-taking adapter.
+    """Canonical profit-taking adapter.
 
-    TP1 is always exactly 50% of the ORIGINAL position. TP2 closes the
-    remaining 50%. The trigger is the canonical stored target price, never a
-    hard-coded ROE threshold. LIVE execution is delegated to close_partial()
-    / close_position_full(), which verify exchange fills before state changes.
+    DEFAULT (SINGLE_TP_ENABLED): TP1 is the ONLY take-profit and closes the
+    FULL remaining position (100%) through the same verified full-close
+    pipeline previously reserved for TP2. TP2 / runner / partial scale-outs are
+    disabled (they are derived OFF from SINGLE_TP_ENABLED). The trigger is the
+    canonical stored target price, never a hard-coded ROE threshold.
+
+    LEGACY (SINGLE_TP_ENABLED=False): TP1 is exactly 50% of the ORIGINAL
+    position; TP2 closes the remaining 50%. LIVE execution is delegated to
+    close_partial() / close_position_full(), which verify exchange fills before
+    state changes.
     """
     if not position_state.get("open"):
         return "HOLD"
+    _single_tp = bool(SINGLE_TP_ENABLED)
+    _tp2_enabled = bool(TP2_ENABLED) and not _single_tp
     side = str(position_state.get("side", "BUY")).upper()
     entry = float(position_state.get("entry", 0.0) or 0.0)
     if entry <= 0:
@@ -6467,11 +6622,11 @@ def apply_profit_engine(symbol, current_price, df, idx, position_state):
     pnl_pct = dirv * (price - entry) / entry * 100.0
 
     if not position_state.get("tp1_hit", False) and valid_tp1:
-        # TP1 = 50% of the ORIGINAL position. close_partial() computes the
-        # quantity from remaining_qty, which equals qty_initial before TP1.
-        # Defensive heal: adopted/restored states can lack remaining_qty (or a
-        # trailing reconcile can momentarily zero it); derive it from the
-        # original size so a genuine TP1 touch is never silently blocked.
+        # TP1 = the ONLY take-profit in SINGLE-TP mode: it closes the FULL
+        # remaining position (100%) through the verified full-close pipeline
+        # (the same path TP2 used in legacy 50/50 mode). No runner extension and
+        # no partial scale-out may follow because the position is fully closed.
+        # In LEGACY mode TP1 = 50% of the ORIGINAL position via close_partial().
         if float(position_state.get("remaining_qty", 0.0) or 0.0) <= 0:
             _heal = float(position_state.get("qty_initial") or position_state.get("qty") or 0.0)
             if _heal <= 0:
@@ -6481,6 +6636,20 @@ def apply_profit_engine(symbol, current_price, df, idx, position_state):
             position_state["mark_price"] = price
         except Exception:
             pass
+        if _single_tp:
+            position_state["close_reason"] = "SINGLE_TP"
+            _tp1_ok = bool(close_position_full(close_price=price, stage="TP1"))
+            if not _tp1_ok:
+                _trade_event("TP1_EXECUTION_FAILED", reason="SINGLE_TP_FULL_CLOSE_NOT_VERIFIED", target=tp1)
+                return "HOLD"
+            position_state["tp1_hit"] = True
+            position_state["tp1_done"] = True
+            position_state["tp2_hit"] = True
+            # Single TP closes 100%: no runner extension, no trailing re-arm.
+            position_state["runner_mode"] = False
+            position_state["trail_activated"] = False
+            log_execution(f"TP1 SINGLE-TP executed at {price:.6f} target={tp1:.6f} | closed remaining 100%", "SUCCESS")
+            return "TP1"
         _tp1_ok = bool(close_partial(0.5, stage="TP1"))
         if not _tp1_ok:
             _trade_event("TP1_EXECUTION_FAILED", reason="PROFIT_ENGINE_PARTIAL_NOT_VERIFIED", target=tp1)
@@ -6514,7 +6683,7 @@ def apply_profit_engine(symbol, current_price, df, idx, position_state):
         log_execution(f"TP1 EXECUTED at {price:.6f} target={tp1:.6f} | closed 50%", "SUCCESS")
         return "TP1"
 
-    if position_state.get("tp1_hit", False) and not position_state.get("tp2_hit", False) and valid_tp2:
+    if _tp2_enabled and position_state.get("tp1_hit", False) and not position_state.get("tp2_hit", False) and valid_tp2:
         # TP2 = the entire remaining position (the other 50%). This is a FULL
         # close, not a second 30% partial, so the exchange and accounting end at
         # exactly zero quantity.
@@ -12892,6 +13061,11 @@ def sync_all_states():
     valid = validate_position_state(STATE, symbol)
     if valid is None:
         log_execution(f"[SYNC] Position on {symbol} closed externally – finalizing realized outcome before local cleanup.", "WARN")
+        # The venue stopped reporting the position (authoritative NOT_FOUND).
+        # Tag the realized close so the telegram reason is never "UNKNOWN" and
+        # re-adoptions of the same physical position stay deduplicated.
+        STATE["close_reason"] = STATE.get("close_reason") or "EXTERNAL_CLOSE"
+        STATE["last_management_event"] = STATE.get("close_reason")
         try:
             finalize_trade_with_reality(symbol)
         except Exception as _finalize_exc:
@@ -12911,10 +13085,26 @@ def sync_all_states():
     _set_wallet_pnl_memory(real_pnl, real_pnl_pct)
 
 def validate_position_state(local_pos, symbol):
-    real_pos = fetch_position(symbol)
-    if real_pos is None:
+    """Verify a live position against the venue WITHOUT conflating transport
+    failures with a real close.
+
+    Returns:
+      None       -> position is authoritatively NOT_FOUND on the venue (real close)
+      local_pos  -> position still open, OR venue query was PAUSED/ERROR and the
+                    local state must be preserved (never finalize on a failed
+                    query)
+      real_pos   -> venue-reported position (OK)
+    """
+    real_pos, status = fetch_position_status(symbol)
+    if status == "NOT_FOUND":
         return None
-    return real_pos
+    if status == "OK":
+        return real_pos
+    if status == "PAUSED":
+        log_execution(f"[SYNC] {symbol} is PAUSED on the venue; local state preserved (never converted into a close)", "WARN", debounce_key=f"sync_paused_{symbol}", debounce_sec=60)
+        return local_pos
+    log_execution(f"[SYNC] {symbol} venue query ERROR; local state preserved (never converted into a close)", "WARN", debounce_key=f"sync_error_{symbol}", debounce_sec=60)
+    return local_pos
 
 _external_intel_service = None
 _external_intel_alerted = {}

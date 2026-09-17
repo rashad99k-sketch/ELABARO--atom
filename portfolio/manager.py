@@ -558,6 +558,26 @@ class PortfolioManager:
         qty = float(item.get("contracts", 0) or 0)
         entry = float(item.get("entryPrice", 0) or 0)
         side = str(item.get("side", "BUY") or "BUY").upper()
+        # Idempotency guard: never re-adopt a physical position whose close has
+        # already been announced (durable Telegram dedup ledger). Re-adoption
+        # would mint a fresh REC-{symbol}-{side}-{millis} id and re-enter the
+        # management loop, re-sending "TRADE CLOSED" telegrams for the SAME
+        # physical position under changing ids. Identity is venue-attribute
+        # based (symbol|side|entry|qty_initial), NOT the local trade_id.
+        if self.engine is not None and callable(getattr(self.engine, "_is_close_announced", None)):
+            try:
+                _probe_qty = qty
+                if _probe_qty <= 0:
+                    _probe_qty = float(item.get("qty", 0) or 0)
+                if _probe_qty > 0:
+                    _id_key = self.engine._close_identity_key(symbol, side, entry, _probe_qty)
+                    if self.engine._is_close_announced(_id_key):
+                        self.engine.log_execution(
+                            f"[RECOVERY] {symbol} {side} physical position was already announced CLOSED (identity {_id_key}); skipping re-adoption to prevent duplicate close notifications",
+                            "WARN", debounce_key=f"skip_readopt_{_id_key}", debounce_sec=60)
+                        return False
+            except Exception:
+                pass
         if side not in ("BUY", "SELL"):
             side = "BUY"
         if not symbol or qty <= 0 or entry <= 0:

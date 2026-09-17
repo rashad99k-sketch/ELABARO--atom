@@ -28,11 +28,40 @@ os.environ.setdefault(
 # BARON tests opt back in with BARON_ZONE_JUDGE="1".
 os.environ.setdefault("BARON_ZONE_JUDGE", "0")
 
+# The production engine defaults SINGLE_TP_ENABLED=true (TP1 closes 100%).
+# The offline suite still exercises the LEGACY 50/50 profit model, so pin
+# legacy mode here. The engine reads this at import time AND apply_profit_engine
+# / close_partial re-read the module flags at call time, so a mid-test re-import
+# (after os.environ.clear()) must also see legacy mode -> re-asserted in the
+# autouse fixture below. Dedicated SINGLE-TP tests opt back in by setting
+# E.SINGLE_TP_ENABLED=True (and derived flags) inside their own fixtures.
+os.environ["SINGLE_TP_ENABLED"] = "false"
+os.environ["TP2_ENABLED"] = "true"
+os.environ["RUNNER_ENABLED"] = "true"
+os.environ["PARTIAL_CLOSE_ENABLED"] = "true"
+
+# Never persist the durable close-identity ledger (Telegram dedup) into the
+# project runtime/ directory during test runs.
+os.environ.setdefault("CLOSE_LEDGER_PATH", os.path.join(tempfile.mkdtemp(prefix="close_ledger_test_"), "close_identity_ledger.json"))
+
 
 @pytest.fixture(autouse=True)
 def _baron_gate_off_for_offline_suite():
     os.environ["BARON_ZONE_JUDGE"] = "0"
+    os.environ["SINGLE_TP_ENABLED"] = "false"
+    os.environ["TP2_ENABLED"] = "true"
+    os.environ["RUNNER_ENABLED"] = "true"
+    os.environ["PARTIAL_CLOSE_ENABLED"] = "true"
     yield
+    # Reset the durable close-identity ledger so no close-announcement state
+    # leaks across tests within the same process (TG-1..8 rely on fresh state).
+    try:
+        import sys as _sys
+        _engine = _sys.modules.get("core.engine")
+        if _engine is not None and callable(getattr(_engine, "_reset_close_ledger", None)):
+            _engine._reset_close_ledger()
+    except Exception:
+        pass
 
 if "ccxt" not in sys.modules:
     ccxt = types.ModuleType("ccxt")
