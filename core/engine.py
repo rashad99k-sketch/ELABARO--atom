@@ -3764,13 +3764,12 @@ _reconciliation_pending = False
 
 
 def _hedge_position_side(direction):
-    """Derive the BingX hedge-mode PositionSide from the POSITION direction.
+    """Derive the hedging PositionSide from the POSITION direction.
 
-    The account runs in Hedge Mode, which requires PositionSide to be LONG or
-    SHORT (never BOTH). This maps the bot's internal position direction
-    (BUY=long, SELL=short; also accepts buy/sell/LONG/SHORT/long/short) to the
-    exchange's hedge-mode value. PositionSide always reflects the position being
-    opened or closed, not the order side.
+    Historically the account assumes Hedge Mode, where PositionSide must be LONG
+    or SHORT (never BOTH). This maps the bot's internal position direction
+    (BUY=long, SELL=short) to the hedging value. PositionSide always reflects
+    the position being opened or closed, not the order side.
     """
     d = str(direction).upper()
     if d in ("BUY", "LONG"):
@@ -3778,6 +3777,145 @@ def _hedge_position_side(direction):
     if d in ("SELL", "SHORT"):
         return "SHORT"
     raise ValueError(f"cannot derive hedge positionSide from direction: {direction!r}")
+
+
+# ========== BINGX POSITION-MODE AWARE CLOSE (exchange-authoritative) ==========
+# BingX Futures runs in either One-way Mode (single position per pair, PositionSide
+# must be BOTH and reduceOnly=true prevents flipping into the opposite position) or
+# Hedge Mode (dual positions per pair, PositionSide LONG/SHORT, and reduceOnly must
+# NOT be sent). A close that ignores the account's actual mode can be rejected
+# (109400) or, worse, open the OPPOSITE position. The mode is therefore queried
+# from the venue before a close order is assembled, never guessed from config.
+_POSITION_MODE_CACHE = {"mode": None, "ts": 0.0}
+POSITION_MODE_CACHE_TTL = float(os.getenv("POSITION_MODE_CACHE_TTL", "120"))
+
+# Bounded venue re-confirmation window after a close order is filled. Tuning
+# these lower (tests) gives fast-fail behaviour for the post-close confirm.
+CLOSE_CONFIRM_TIMEOUT = float(os.getenv("CLOSE_CONFIRM_TIMEOUT", "10"))
+CLOSE_CONFIRM_INTERVAL = float(os.getenv("CLOSE_CONFIRM_INTERVAL", "1"))
+
+
+def _detect_position_mode():
+    """Return the venue position mode: "hedge" | "oneway" | "unknown".
+
+    Primary source: ccxt bingx fetch_position_mode() -> GET /openApi/swap/v1/
+    positionSide/dual (dualSidePosition). Production ccxt.bingx exposes this
+    method, so LIVE close always uses venue truth. When the venue method is not
+    available (offline unit seams), fall back to the configured POSITION_MODE
+    (default "hedge" -- the account's documented mode) so deterministic test
+    venues never get their scripted position data consumed by mode inference.
+    A failed query returns "unknown" so the close path fails closed.
+    """
+    global _POSITION_MODE_CACHE
+    now = time.time()
+    cached = _POSITION_MODE_CACHE.get("mode")
+    if cached and (now - _POSITION_MODE_CACHE.get("ts", 0.0)) < POSITION_MODE_CACHE_TTL:
+        return cached
+    mode = "unknown"
+    try:
+        fpm = getattr(ex, "fetch_position_mode", None)
+        if callable(fpm):
+            info = fpm()
+            if isinstance(info, dict):
+                hedged = info.get("hedged")
+                if hedged is not None:
+                    mode = "hedge" if hedged else "oneway"
+    except Exception as _me:
+        log_execution(f"[POSITION_MODE] fetch_position_mode failed: {_me}", "WARN")
+    if mode == "unknown":
+        env_mode = str(os.getenv("POSITION_MODE", "hedge")).strip().lower()
+        if env_mode in ("hedge", "oneway"):
+            mode = env_mode
+    _POSITION_MODE_CACHE = {"mode": mode, "ts": now}
+    if mode == "hedge":
+        log_execution("[POSITION_MODE] close context: HEDGE mode (positionSide LONG/SHORT, no reduceOnly)", "INFO")
+    elif mode == "oneway":
+        log_execution("[POSITION_MODE] close context: ONE-WAY mode (positionSide BOTH + reduceOnly=true)", "WARN")
+    else:
+        log_execution("[POSITION_MODE] cannot determine position mode; failing closed on mode-ambiguous close", "ERROR")
+    return mode
+
+
+def _reset_position_mode_cache():
+    global _POSITION_MODE_CACHE
+    _POSITION_MODE_CACHE = {"mode": None, "ts": 0.0}
+
+
+def _close_order_params(pos_side, mode="unknown"):
+    """BingX-mode-correct params for a CLOSE order.
+
+    hedge        -> {"positionSide": pos_side}            (reduceOnly NOT allowed)
+    oneway       -> {"positionSide": "BOTH", "reduceOnly": True} (default reduceOnly
+                    in one-way mode is FALSE, so an explicit True is mandatory to
+                    guarantee the order can never flip into the opposite position)
+    unknown      -> None (caller must fail closed; never guess a mode)
+    """
+    if mode == "hedge":
+        return {"positionSide": pos_side}
+    if mode == "oneway":
+        return {"positionSide": "BOTH", "reduceOnly": True}
+    return None
+
+
+def _close_side_for(pos_side):
+    """Closing order side: a LONG position is reduced by SELL, a SHORT by BUY.
+    This invariant is what prevents a close from ACCIDENTALLY OPENING the
+    opposite position."""
+    return "sell" if str(pos_side).upper() == "LONG" else "buy" if str(pos_side).upper() == "SHORT" else "sell"
+
+
+def _close_min_qty_failure_reason(symbol, sym, qty, price):
+    """Deterministic close-qty failure codes (exchange-authoritative guard).
+
+    Returns a (reason, emitted) tuple. reason is one of:
+      CLOSE_QTY_INVALID           qty is not positive
+      CLOSE_QTY_BELOW_MIN         qty < market minimum amount
+      CLOSE_NOTIONAL_BELOW_MIN    qty*price < market minimum notional (cost)
+      None                        qty is closable
+    The legacy tokens (INVALID_QUANTITY_ZERO/BELOW_MIN_QUANTITY) are embedded so
+    existing callers and tests that matched them keep working while the new
+    deterministic codes are the leading token.
+    """
+    try:
+        q = float(qty or 0.0)
+    except (TypeError, ValueError):
+        q = 0.0
+    if q <= 0:
+        reason = "CLOSE_QTY_INVALID (INVALID_QUANTITY_ZERO)"
+        _trade_event("CLOSE_FAILED", reason=reason)
+        log_execution(f"[CLOSE] {symbol} close qty must be > 0 to place a close order ({q!r})", "ERROR")
+        return reason
+    market = None
+    try:
+        market = ex.market(sym)
+    except Exception:
+        market = None
+    limits = (market or {}).get("limits", {}) or {}
+    min_amt = float((limits.get("amount") or {}).get("min", 0.0) or 0.0)
+    if min_amt > 0 and q < min_amt:
+        reason = f"CLOSE_QTY_BELOW_MIN:{q:.8f}<{min_amt:.8f} (BELOW_MIN_QUANTITY)"
+        _trade_event("CLOSE_FAILED", reason=reason)
+        log_execution(f"[CLOSE] {symbol} close qty {q:.8f} below market minimum {min_amt:.8f}; refusing unsizeable close", "ERROR")
+        return reason
+    min_cost = float((limits.get("cost") or {}).get("min", 0.0) or 0.0)
+    if min_cost > 0:
+        try:
+            px = float(price or STATE.get("mark_price") or 0.0)
+        except (TypeError, ValueError):
+            px = 0.0
+        notional = q * px
+        if notional > 0 and notional < min_cost:
+            reason = f"CLOSE_NOTIONAL_BELOW_MIN:{notional:.8f}<{min_cost:.8f}"
+            _trade_event("CLOSE_FAILED", reason=reason)
+            log_execution(f"[CLOSE] {symbol} close notional {notional:.8f} below market minimum {min_cost:.8f}; refusing unsizeable close", "ERROR")
+            return reason
+    prec = (market or {}).get("precision", {}) or {}
+    _prec = prec.get("amount", 0) or 0
+    if _prec:
+        step = 10 ** -float(_prec)
+        if step > 0 and abs((q / step) - round(q / step)) > 1e-9:
+            log_execution(f"[CLOSE] {symbol} close qty {q:.8f} is not a multiple of precision step {step}", "WARN")
+    return None
 
 
 def _trade_event(event, **data):
@@ -4369,29 +4507,77 @@ def _close_partial_min_ok(symbol, sym, qty):
     limits (zero / min amount / min notional) BEFORE an order is placed. A tiny
     or overflowing remainder must never be blindly re-ordered -- the exchange
     would reject it and the close lifecycle would retry forever. Returns False
-    and emits CLOSE_FAILED when the quantity cannot possibly fill."""
+    and emits CLOSE_FAILED when the quantity cannot possibly fill.
+    Delegates to the deterministic code helper (CLOSE_QTY_INVALID /
+    CLOSE_QTY_BELOW_MIN / CLOSE_NOTIONAL_BELOW_MIN)."""
     try:
-        if qty is None or float(qty) <= 0:
-            log_execution("[CLOSE] quantity must be > 0 to place a close order", "ERROR")
-            _trade_event("CLOSE_FAILED", reason="INVALID_QUANTITY_ZERO")
-            return False
-        market = ex.market(sym)
-        limits = market.get("limits", {}).get("amount", {}) or {}
-        min_amt = float(limits.get("min", 0.0) or 0.0)
-        if min_amt > 0 and float(qty) < min_amt:
-            log_execution(f"[CLOSE] {symbol} close qty {float(qty):.6f} below market minimum {min_amt:.6f}; refusing unsizeable close", "ERROR")
-            _trade_event("CLOSE_FAILED", reason=f"BELOW_MIN_QUANTITY:{float(qty):.6f}<{min_amt:.6f}")
-            return False
-        _prec = market.get("precision", {}).get("amount", 0) or 0
-        if _prec:
-            _step = 10 ** -float(_prec)
-            if _step > 0 and abs((float(qty) / _step) - round(float(qty) / _step)) > 1e-9:
-                log_execution(f"[CLOSE] {symbol} close qty {float(qty):.6f} is not a multiple of precision step {_step}", "WARN")
+        checked = _close_min_qty_failure_reason(symbol, sym, qty, STATE.get("mark_price"))
+        return checked is None
     except Exception:
         # Limit lookup is advisory-only: never block a close on a metadata
         # fetch failure. The verified position path is authoritative.
+        return True
+
+
+def _close_failure_code_for(symbol, sym, qty):
+    """Derive the deterministic close failure code for a rejected quantity
+    without re-triggering side effects (events/logs) of the min-ok checker."""
+    try:
+        q = float(qty or 0.0)
+    except (TypeError, ValueError):
+        q = 0.0
+    if q <= 0:
+        return "CLOSE_QTY_INVALID"
+    try:
+        market = ex.market(sym)
+        min_amt = float((market.get("limits", {}).get("amount") or {}).get("min", 0.0) or 0.0)
+        if min_amt > 0 and q < min_amt:
+            return "CLOSE_QTY_BELOW_MIN"
+        min_cost = float((market.get("limits", {}).get("cost") or {}).get("min", 0.0) or 0.0)
+        if min_cost > 0:
+            try:
+                px = float(STATE.get("mark_price") or 0.0)
+            except (TypeError, ValueError):
+                px = 0.0
+            if q * px > 0 and q * px < min_cost:
+                return "CLOSE_NOTIONAL_BELOW_MIN"
+    except Exception:
         pass
-    return True
+    return "CLOSE_QTY_INVALID"
+
+
+def _confirm_exchange_zero(symbol, pos_side, timeout=None, interval=None):
+    """Bounded post-close confirmation: keep re-querying the venue until the
+    requested hedge leg reports zero/absent, the window expires, or the venue
+    errors. NOT_FOUND is authoritative (CLOSED). A PAUSED/ERROR within the
+    window must NOT be treated as closed -- fail closed (UNKNOWN). Returns
+    'CLOSED' | 'PRESENT' | 'UNKNOWN'."""
+    total = float(timeout if timeout is not None else CLOSE_CONFIRM_TIMEOUT)
+    wait = float(interval if interval is not None else CLOSE_CONFIRM_INTERVAL)
+    deadline = time.time() + total
+    last_status = None
+    last_qty = 0.0
+    while True:
+        snap = _verify_close_target(symbol, pos_side)
+        st = snap["status"]
+        if st in ("PAUSED", "ERROR"):
+            last_status = st
+        elif st == "OK":
+            if not snap["exists"] or snap["actual_qty"] <= 0:
+                return "CLOSED"
+            last_qty = snap["actual_qty"]
+            last_status = "OK"
+        else:
+            # NOT_FOUND status from fetch_position_status is used only when pos
+            # is None; exists is authoritative regardless of the status label.
+            if not snap["exists"] or snap["actual_qty"] <= 0:
+                return "CLOSED"
+        if time.time() >= deadline:
+            break
+        time.sleep(wait)
+    if last_status in ("PAUSED", "ERROR") or last_status is None:
+        return "UNKNOWN"
+    return "PRESENT" if last_qty > 0 else "CLOSED"
 
 
 def _close_full_live_verified(symbol, sym, pos_side, stage, requested_qty):
@@ -4401,8 +4587,20 @@ def _close_full_live_verified(symbol, sym, pos_side, stage, requested_qty):
     Position Verify -> State Sync. Every close order is preceded by a fresh
     leg verify; a leg that vanished is synced as ALREADY_CLOSED_ON_EXCHANGE and
     never re-ordered. BingX 101205 is re-verified, never blindly swallowed.
+    The order params are chosen from the venue's ACTUAL position mode
+    (hedge vs one-way) so a one-way account closes with positionSide=BOTH +
+    reduceOnly=true, never fashioning a NEW opposite position. The close
+    quantity is the EXCHANGE quantity -- 100% of what the venue actually
+    holds -- not a stale local figure.
     """
-    req_side = "sell" if pos_side == "LONG" else "buy"
+    req_side = _close_side_for(pos_side)
+    mode = _detect_position_mode()
+    close_params = _close_order_params(pos_side, mode)
+    if not close_params:
+        _trade_event("CLOSE_FAILED", reason="CLOSE_POSITION_MODE_UNKNOWN")
+        _log_close_outcome(symbol, pos_side, "CLOSE_FAILED", "CLOSE_POSITION_MODE_UNKNOWN")
+        log_execution(f"[CLOSE] {symbol} {pos_side}: position mode unknown on the venue; refusing to guess a close order", "ERROR")
+        return False
     attempt = 0
     while attempt < 3:
         attempt += 1
@@ -4416,19 +4614,19 @@ def _close_full_live_verified(symbol, sym, pos_side, stage, requested_qty):
             return _sync_closed_on_exchange(symbol, ALREADY_CLOSED_ON_EXCHANGE, pos_side,
                                             opposite_exists=snap["opposite_exists"])
         actual_qty = snap["actual_qty"]
-        qty_this = min(float(requested_qty), actual_qty)
+        qty_this = actual_qty  # exchange quantity is authoritative for a full close
         if qty_this <= 0:
             return _sync_closed_on_exchange(symbol, ALREADY_CLOSED_ON_EXCHANGE, pos_side,
                                             opposite_exists=snap["opposite_exists"])
-        if qty_this < requested_qty - 1e-12:
-            log_execution(f"[CLOSE] {symbol} {pos_side}: local qty {requested_qty:.6f} > venue qty {actual_qty:.6f}; closing venue qty", "WARN")
+        if abs(qty_this - float(requested_qty)) > 1e-9:
+            log_execution(f"[CLOSE] {symbol} {pos_side}: venue qty {actual_qty:.6f} != local qty {requested_qty:.6f}; closing the EXCHANGE qty (authoritative)", "WARN")
         qty_precise = float(ex.amount_to_precision(sym, qty_this))
         if not _close_partial_min_ok(symbol, sym, qty_this):
-            _log_close_outcome(symbol, pos_side, "CLOSE_FAILED", "BELOW_MIN_QUANTITY")
+            _log_close_outcome(symbol, pos_side, "CLOSE_FAILED", _close_failure_code_for(symbol, sym, qty_this))
             return False
-        log_execution(f"[CLOSE] verified {symbol} {pos_side} qty={actual_qty:.6f} -> placing market close (attempt {attempt})", "INFO")
+        log_execution(f"[CLOSE] verified {symbol} {pos_side} qty={actual_qty:.6f} -> placing market close [{mode}] (attempt {attempt})", "INFO")
         try:
-            order = safe_api_call(ex.create_order, sym, "market", req_side, qty_precise, params={"positionSide": pos_side})
+            order = safe_api_call(ex.create_order, sym, "market", req_side, qty_precise, params=close_params)
         except Exception as e:
             if _is_no_position_error(e):
                 # 101205: the requested leg is not on the venue. Re-verify BEFORE
@@ -4471,13 +4669,13 @@ def _close_full_live_verified(symbol, sym, pos_side, stage, requested_qty):
                 "order_id": str(order_id), "ts": time.time(),
             }
             time.sleep(1)
-            snap2 = _verify_close_target(symbol, pos_side)
-            if snap2["status"] in ("PAUSED", "ERROR"):
-                _trade_event("CLOSE_STATUS_UNKNOWN", reason=snap2["status"])
-                log_execution(f"[CLOSE] Position status UNKNOWN ({snap2['status']}); refusing local close", "ERROR")
-                _log_close_outcome(symbol, pos_side, "CLOSE_STATUS_UNKNOWN", snap2["status"])
+            confirm = _confirm_exchange_zero(symbol, pos_side)
+            if confirm == "UNKNOWN":
+                _trade_event("CLOSE_STATUS_UNKNOWN", reason="POST_FILL_CONFIRM_UNKNOWN")
+                log_execution(f"[CLOSE] Position status UNKNOWN after fill for {symbol} {pos_side}; refusing local close", "ERROR")
+                _log_close_outcome(symbol, pos_side, "CLOSE_STATUS_UNKNOWN", "POST_FILL_CONFIRM_UNKNOWN")
                 return False
-            if not snap2["exists"] or snap2["actual_qty"] <= 0:
+            if confirm == "CLOSED":
                 log_execution("[CLOSE] Position confirmed closed (no venue qty)", "SUCCESS")
                 try:
                     _cancel_native_protection(symbol)
@@ -4493,7 +4691,7 @@ def _close_full_live_verified(symbol, sym, pos_side, stage, requested_qty):
                     log_execution(f"[CLOSE] finalize failed: {_e}", "WARN")
                 _log_close_outcome(symbol, pos_side, "CLOSE_EXECUTED", "CONFIRMED_ABSENT")
                 return True
-            log_execution(f"[CLOSE] Position still has qty {snap2['actual_qty']:.6f} after close order. Retrying venue qty.", "WARN")
+            log_execution("[CLOSE] Position still has qty after close order. Retrying venue qty.", "WARN")
         else:
             log_execution(f"[CLOSE] Order did not fill (attempt {attempt})", "ERROR")
             time.sleep(1)

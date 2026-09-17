@@ -231,18 +231,34 @@ class PositionSideCloseOrders(unittest.TestCase):
 
 
 def _scan_for_both_and_one_way():
-    """Assert no active production order path sends BOTH or forces one-way."""
+    """Assert no active POSITION-OPEN order path sends BOTH, and that the close
+    path is mode-aware (never blindly forces one mode).
+
+    BingX runs in Hedge Mode (LONG/SHORT positionSide, reduceOnly NOT allowed)
+    or One-way Mode (positionSide BOTH + reduceOnly=true on closes). Open orders
+    must therefore ALWAYS derive LONG/SHORT from the position direction, while
+    close orders must choose their params from the venue's ACTUAL mode via
+    _close_order_params(). A close that hardcodes BOTH would break hedge
+    accounts (109400); a close that never uses BOTH would break one-way
+    accounts (an order could flip into the opposite position)."""
     import pathlib
     active = [pathlib.Path("core/engine.py"), pathlib.Path("app/bootstrap.py"),
               pathlib.Path("execution/execution_service.py")]
+    core = active[0].read_text(encoding="utf-8")
+    if "_close_order_params" not in core:
+        return "core/engine.py no longer has a mode-aware close params selector"
+    if "_hedge_position_side" not in core:
+        return "core/engine.py no longer derives hedge mode positionSide from direction"
+    if "fetch_position_mode" not in core:
+        return "core/engine.py no longer detects the venue position mode"
+    if "_close_side_for" not in core:
+        return "core/engine.py no longer derives the close order side from the position side"
     for p in active:
         text = p.read_text(encoding="utf-8")
-        if "positionSide\": \"BOTH\"" in text or "positionSide': 'BOTH'" in text:
-            return f"{p} still contains positionSide BOTH"
-        if "positionSide=\"BOTH\"" in text:
-            return f"{p} still contains positionSide BOTH"
         if "set_position_mode(False)" in text:
             return f"{p} still forces one-way mode"
+        if "positionSide=\"BOTH\"" in text:
+            return f"{p} still hardcodes positionSide BOTH"
     return None
 
 
